@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+tmp/
+work/
+forge_extension/
+settings.json
+runtime-settings.json
+runtime-selection.json
+models/
+native/nr/bin/
+build/
+dist/
+*.log

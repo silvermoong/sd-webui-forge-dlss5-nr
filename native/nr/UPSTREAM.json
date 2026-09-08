@@ -1,0 +1,13 @@
+{
+  "repository": "lisitskyaa/ComfyUI-DLSS5-NR",
+  "commit": "a3de4781eef81afe80d0226d1ede0b46b3346a63",
+  "license": "MIT",
+  "files": {
+    "LICENSE": {"size": 1086, "git_blob_sha1": "e60a3357b1b7f4d80ff78ce2fc6b8dc94ca2b94e"},
+    "THIRD_PARTY_NOTICES.md": {"size": 3646, "git_blob_sha1": "73cd7b61d9834772c6900ff2a4e9ced48ff39bc4"},
+    "native/dlss5nr_bridge.cpp": {"size": 38777, "git_blob_sha1": "488d836b8317cbc1a8dcbe999798915f82875b84"},
+    "native/caller_shim.cpp": {"size": 2875, "git_blob_sha1": "4049e4203704b01ce3daf2d1978d99f3d3909109"},
+    "native/nvof_flow.cpp": {"size": 18868, "git_blob_sha1": "6ad0cc4d6ed96b00c62d1b2693a06c6c4f3eb518"},
+    "native/nvof_flow.h": {"size": 1421, "git_blob_sha1": "d2df61acf8f489e1b2cbbd53644c46c782a9c55d"}
+  }
+}

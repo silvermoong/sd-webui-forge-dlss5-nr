@@ -1,0 +1,35 @@
+name: CPU tests and native bridge build
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements-runtime.txt
+      - run: python -B -m unittest discover -s tests -v
+        env:
+          GRADIO_ANALYTICS_ENABLED: 'False'
+  bridge:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S native -B build -A x64
+      - run: cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mit-bridge-windows-x64
+          path: |
+            build/Release/dlss5nr_bridge.dll
+            build/Release/nvngx.dll_comfy.dll
+            LICENSE
+            THIRD_PARTY_NOTICES.md

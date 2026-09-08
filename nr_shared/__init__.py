@@ -1,0 +1,1 @@
+"""Shared, local NR execution. Importing this package does not start a process."""

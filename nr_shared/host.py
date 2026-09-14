@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 
-from .contract import PROTOCOL, SharedError, validate_params, validate_runtime
+from .contract import MAX_PASSES, PROTOCOL, SharedError, validate_params, validate_pass_params, validate_runtime
 
 TERMINAL = frozenset(("done", "error", "canceled"))
 
@@ -89,12 +89,16 @@ class Host:
         command["runtime"] = validate_runtime(command.get("runtime"))
         required = {"op", "id", "source_path", "output_dir", "source", "params", "runtime",
                     "start", "end", "preview_kind", "max_edge"}
-        if set(command) != required:
+        if set(command) not in (required, required | {"passes"}):
             raise SharedError(400, "NR 插件必须提交完整单图请求")
         if (command["start"] != 0 or command["end"] != 0 or command["preview_kind"] != ""
                 or type(command["max_edge"]) is not int or command["max_edge"] != 0):
             raise SharedError(400, "此接口只执行原尺寸单图，不能提交预览或视频")
         command["params"] = validate_params(command["params"])
+        if "passes" in command:
+            command["passes"] = validate_pass_params(command["passes"])
+            if command["params"] != command["passes"][0]:
+                raise SharedError(400, "NR参数与首遍快照不一致")
         source = command["source"]
         if (not isinstance(source, dict) or source.get("kind", "image") != "image"
                 or not isinstance(source.get("sha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", source["sha256"])):
@@ -208,7 +212,7 @@ class Host:
                 raise SharedError(409, "NR 正在处理或等待；先取消自己的任务，不能释放他人的任务")
         # No state mutex around IO, filesystem hashing or process lifetime calls.
         if op == "runtime":
-            return self.catalog.runtime(body["device"])
+            return {**self.catalog.runtime(body["device"]), "max_passes": MAX_PASSES}
         if op == "status":
             value = self.worker.status()
             with self._cv:

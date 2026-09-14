@@ -11,7 +11,7 @@ import uuid
 import numpy as np
 from PIL import Image, ImageCms
 
-from nr_shared.contract import validate_runtime
+from nr_shared.contract import STAGES, active_passes, validate_runtime
 
 
 @contextmanager
@@ -76,7 +76,7 @@ class ForgeAdapter:
         return Cancellation(self.shared.state)
 
     def prepare(self, p, spec):
-        if p.enable_hr and spec["stage"] == "before_hr" and p.latent_scale_mode is not None:
+        if p.enable_hr and active_passes(spec, "before_hr") and p.latent_scale_mode is not None:
             if (getattr(p, "hr_checkpoint_name", None) not in (None, "", "Use same checkpoint")
                     or getattr(p, "hr_additional_modules", None) not in (None, ["Use same choices"])
                     or getattr(p, "refiner_checkpoint", None) not in (None, "", "None", "none")):
@@ -86,6 +86,9 @@ class ForgeAdapter:
             raise RuntimeError("NR环境不可用：" + "; ".join(map(str, status.get("missing", []))))
         if validate_runtime(status.get("runtime")) != spec["runtime"]:
             raise RuntimeError("NR环境快照已过期，请重新选择显卡并确认 fingerprint")
+        required = max(len(active_passes(spec, stage)) for stage in STAGES)
+        if required > 1 and (type(status.get("max_passes")) is not int or status["max_passes"] < required):
+            raise RuntimeError("NR后台尚未加载多页支持；请在空闲时重启Forge，本次采样未开始")
 
     def decode(self, p, samples):
         if not getattr(samples, "already_decoded", False):
@@ -108,7 +111,18 @@ class ForgeAdapter:
         p.sd_model.ini_latent = None
         return result.to(device=samples.device, dtype=samples.dtype)
 
-    def enhance(self, pixels, spec, cancel):
+    def enhance(self, pixels, spec, cancel, *, stage=None):
+        passes = active_passes(spec, stage)
+        if not passes or len({record["stage"] for record in passes}) != 1:
+            raise ValueError("NR每次处理必须对应一个非空插入阶段")
+        params = [record["params"] for record in passes]
+
+        def native_matches(native):
+            return (isinstance(native, dict) and native.get("hardware_verified") is True
+                    and native.get("device") == spec["runtime"]["device"]
+                    and " ".join(str(native.get("gpu_name", "")).split()).casefold()
+                    == " ".join(spec["runtime"]["gpu_name"].split()).casefold())
+
         array = pixels.detach().float().cpu().numpy()
         # Anima's Qwen image VAE decodes N,T,C,H,W, even for a still (T=1).
         # Latents use N,C,T,H,W instead: never squeeze that axis or flatten a video.
@@ -136,8 +150,10 @@ class ForgeAdapter:
                 command = dict(op="run", id=request_id, source_path=str(source), output_dir=str(output),
                                source=dict(id=request_id, sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
                                            kind="image", width=rgb.shape[1], height=rgb.shape[0]),
-                               params=deepcopy(spec["params"]), runtime=deepcopy(spec["runtime"]),
+                               params=deepcopy(params[0]), runtime=deepcopy(spec["runtime"]),
                                start=0., end=0., preview_kind="", max_edge=0)
+                if len(passes) > 1:
+                    command["passes"] = deepcopy(params)
 
                 def progress(event):
                     cancel.check()
@@ -145,16 +161,21 @@ class ForgeAdapter:
 
                 result = self.client.run(command, progress=progress, cancel_event=cancel.event)
                 cancel.check()
-                native = result.get("native", {})
                 if (result.get("kind") != "image" or result.get("width") != rgb.shape[1]
-                        or result.get("height") != rgb.shape[0] or result.get("params") != spec["params"]
+                    or result.get("height") != rgb.shape[0] or result.get("params") != params[0]
                         or result.get("runtime_id") != spec["runtime"]["runtime_id"]
-                        or native.get("hardware_verified") is not True
-                        or native.get("device") != spec["runtime"]["device"]
-                        or " ".join(str(native.get("gpu_name", "")).split()).casefold()
-                        != " ".join(spec["runtime"]["gpu_name"].split()).casefold()
+                    or not native_matches(result.get("native"))
                         or result.get("preview") is not False or result.get("approximate") is not False):
                     raise RuntimeError("NR输出尺寸/参数/硬件/运行库证据与本次提交不一致")
+                if len(passes) > 1:
+                    records = result.get("pass_results")
+                    if (result.get("passes") != params or type(result.get("completed_passes")) is not int
+                        or result["completed_passes"] != len(passes) or not isinstance(records, list)
+                        or len(records) != len(passes)
+                        or any(not isinstance(record, dict) or record.get("params") != expected
+                           or not native_matches(record.get("native"))
+                           for record, expected in zip(records, params))):
+                        raise RuntimeError("NR未交回全部启用页的参数与硬件执行证据")
                 if result.get("name") != "output.png":
                     raise RuntimeError("NR返回了非本轮输出路径")
                 path = output / "output.png"
@@ -171,5 +192,6 @@ class ForgeAdapter:
                 worker_pid = result.get("worker_pid")
                 if not isinstance(instance, str) or not instance or type(worker_pid) is not int or worker_pid <= 0:
                     raise RuntimeError("NR后台没有返回执行实例/worker PID")
-                identities.append(dict(instance=instance, worker_pid=worker_pid))
+                identities.append(dict(instance=instance, worker_pid=worker_pid,
+                                       pass_indices=[record["index"] for record in passes]))
         return self.torch.from_numpy(np.stack(enhanced)), identities

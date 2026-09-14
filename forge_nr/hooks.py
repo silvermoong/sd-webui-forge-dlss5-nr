@@ -3,7 +3,7 @@ from functools import wraps
 from copy import deepcopy
 import json
 
-from nr_shared.contract import PROTOCOL, SCRIPT_TITLE, from_script_args, signature
+from nr_shared.contract import PROTOCOL, SCRIPT_TITLE, active_passes, execution_summary, from_script_args, signature
 
 _CALL = "_forge_nr_call"
 _REQUEST = "_forge_nr_request"
@@ -102,6 +102,19 @@ class Installation:
             if getattr(self.cls, name) is wrapper:
                 setattr(self.cls, name, self.originals[name])
 
+    def _enhance(self, pixels, context, stage):
+        enhanced, identities = self.adapter.enhance(pixels, context["spec"], context["cancel"], stage=stage)
+        count = len(identities)
+        indices = [record["index"] for record in active_passes(context["spec"], stage)]
+        if (not count or any(identity.get("pass_indices") != indices for identity in identities)
+                or context["iteration_count"] not in (None, count)):
+            raise RuntimeError("NR各阶段的图片张数或执行页不一致")
+        context["iteration_count"] = count
+        for index in indices:
+            context["pass_counts"][index] = context["pass_counts"].get(index, 0) + count
+        context["identities"].extend(identities)
+        return enhanced
+
     def sample(self, p, *args, **kwargs):
         adapter = self.adapter
         if hasattr(p, _CALL):
@@ -120,8 +133,8 @@ class Installation:
                 spec = read_spec(p)
                 if spec is None:
                     return self.originals["sample"](p, *args, **kwargs)
-                context = dict(spec=deepcopy(spec), identities=[], hires=bool(p.enable_hr))
-            context.update(iteration=iteration, hr_seen=False, model=p.sd_model)
+                context = dict(spec=deepcopy(spec), identities=[], hires=bool(p.enable_hr), count=0, pass_counts={})
+            context.update(iteration=iteration, hr_seen=False, model=p.sd_model, iteration_count=None)
             spec = context["spec"]
             setattr(p, _CALL, context)
             adapter.prepare(p, spec)
@@ -129,17 +142,23 @@ class Installation:
                 context["cancel"] = cancel
                 result = self.originals["sample"](p, *args, **kwargs)
                 cancel.check()
-                if not p.enable_hr or spec["stage"] == "after_hr":
-                    pixels, identities = adapter.enhance(adapter.decode(p, result), spec, cancel)
-                    context["identities"].extend(identities)
-                    result = adapter.decoded_result(pixels)
-                elif not context["hr_seen"]:
+                if p.enable_hr and not context["hr_seen"]:
                     raise RuntimeError("NR未经过高清入口，拒绝把原图当成功结果")
+                stage = "after_hr" if p.enable_hr else "before_hr"
+                if active_passes(spec, stage):
+                    pixels = self._enhance(adapter.decode(p, result), context, stage)
+                    result = adapter.decoded_result(pixels)
+                context["count"] += context["iteration_count"] or 0
+                expected = {record["index"]: context["count"] for record in active_passes(spec)}
+                if not context["count"] or context["pass_counts"] != expected:
+                    raise RuntimeError("NR没有完成全部启用页，拒绝签发成功收据")
                 identities = context["identities"]
-                receipt = dict(protocol=PROTOCOL, status="done", signature=signature(spec), stage=spec["stage"],
-                               count=len(identities), **identities[-1])
+                receipt = dict(protocol=PROTOCOL, status="done", signature=signature(spec), count=context["count"],
+                               **execution_summary(spec, context["count"]),
+                               **{key: identities[-1][key] for key in ("instance", "worker_pid")})
                 p.extra_generation_params[SCRIPT_TITLE] = json.dumps(receipt, ensure_ascii=False)
-                setattr(p, _REQUEST, {key: context[key] for key in ("spec", "identities", "hires", "iteration")})
+                setattr(p, _REQUEST, {key: context[key] for key in
+                                     ("spec", "identities", "hires", "iteration", "count", "pass_counts")})
                 return result
         except BaseException:
             _clear(p)
@@ -150,18 +169,18 @@ class Installation:
 
     def sample_hr_pass(self, p, samples, decoded_samples, *args, **kwargs):
         context = getattr(p, _CALL, None)
-        if context and context["spec"]["stage"] == "before_hr":
+        if context:
             adapter = self.adapter
             context["cancel"].check()
             if context["hr_seen"]:
                 raise RuntimeError("同一轮采样重复进入 NR 高清前入口")
-            if p.latent_scale_mode is not None:
-                if p.sd_model is not context["model"]:
-                    raise ValueError("NR latent 前置的 VAE/模型已改变")
-                decoded_samples = adapter.decode(p, samples)
-            decoded_samples, identities = adapter.enhance(decoded_samples, context["spec"], context["cancel"])
-            context["identities"].extend(identities)
-            if p.latent_scale_mode is not None:
-                samples = adapter.encode(p, decoded_samples, samples)
+            if active_passes(context["spec"], "before_hr"):
+                if p.latent_scale_mode is not None:
+                    if p.sd_model is not context["model"]:
+                        raise ValueError("NR latent 前置的 VAE/模型已改变")
+                    decoded_samples = adapter.decode(p, samples)
+                decoded_samples = self._enhance(decoded_samples, context, "before_hr")
+                if p.latent_scale_mode is not None:
+                    samples = adapter.encode(p, decoded_samples, samples)
             context["hr_seen"] = True
         return self.originals["sample_hr_pass"](p, samples, decoded_samples, *args, **kwargs)

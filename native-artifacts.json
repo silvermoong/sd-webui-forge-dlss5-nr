@@ -1,5 +1,5 @@
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "size": 205293,
   "sha256": "183b2ec5af822bfdc027b6b4b7acab13c46a15254d8ff43da6103eac57de719c",
   "files": {
@@ -9,5 +9,5 @@
     "native/nr/bin/UPSTREAM-LICENSE": "8efc184b8062f7a56abc57eddbb8875bec6be583cd6cced492d96102594c7982",
     "native/nr/bin/THIRD_PARTY_NOTICES.md": "401af7d693fd2a48e2b03fe2e0c8ee3dc2c347c0ba7fdf56a149af74a30fda39"
   },
-  "url": "https://github.com/silvermoong/sd-webui-forge-dlss5-nr/releases/download/v0.2.0/nr-bridge-windows-x64.zip"
+  "url": "https://github.com/silvermoong/sd-webui-forge-dlss5-nr/releases/download/v0.3.0/nr-bridge-windows-x64.zip"
 }

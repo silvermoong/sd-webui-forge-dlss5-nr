@@ -50,7 +50,7 @@ def main(check):
     from fastapi import FastAPI
     from forge_nr.ui import build_ui
     from forge_nr.controls import Presets
-    from nr_shared.contract import from_script_args
+    from nr_shared.contract import ARG_KEYS, STAGES, active_passes, from_script_args
     from nr_runtime.download import DownloadError
 
     namespace = dict(gr=gr, wraps=wraps, inspect=inspect, warnings=warnings,
@@ -80,7 +80,7 @@ def main(check):
                 return dict(ready=False, runtime={**selected, "gpu_name": ""},
                             missing=["尚未确认 DXGI/CUDA 物理卡映射；先列出设备并选择"])
             self.initial = False
-            return dict(ready=True, runtime=selected, runtime_id=selected["runtime_id"])
+            return dict(ready=True, runtime=selected, runtime_id=selected["runtime_id"], max_passes=3)
 
         def status(self):
             return dict(mode="private", running=False, busy=False, pid=None, instance="cpu-fixture")
@@ -155,13 +155,16 @@ function onUiLoaded(callback) {
             setup = SimpleNamespace(root=Path(directory) / (locale + scenario), ensure=ensure,
                                     import_runtime=import_file, select_device=lambda value: None,
                                     mode="auto", runtime_dir=Path("C:/Forge/models/DLSS-NR"), set_mode=select_mode)
+            presets = Presets(setup.root / "data")
+            presets.save("legacy-fixture", "after_hr", {"mix": .25})
             with gr.Blocks(analytics_enabled=False, head=head, css=".input-accordion-checkbox {margin-right: 8px !important;}") as block:
                 hr = gr.Checkbox(False, label="Hires. fix", elem_id="fixture_hr")
                 entry = dict(gr=gr, shared=SimpleNamespace(opts=SimpleNamespace(localization=locale)),
-                             build_ui=build_ui, service=Service(scenario != "ready", setup), presets=Presets(setup.root / "data"),
+                             build_ui=build_ui, service=Service(scenario != "ready", setup), presets=presets,
                              setup=setup, InputAccordion=namespace["InputAccordion"])
                 exec(compile(ast.Module(body=[method], type_ignores=[]), str(script_path), "exec"), entry)
                 controls = entry["ui"](SimpleNamespace(hr=hr), False)
+                assert len(controls) == len(ARG_KEYS) == 35
                 capture = gr.Button("Capture request (CPU fixture)", elem_id="fixture_capture")
                 result = gr.Textbox(label="Submitted arguments", elem_id="fixture_request")
                 sequence = 0
@@ -169,9 +172,10 @@ function onUiLoaded(callback) {
                 def submitted(*values):
                     nonlocal sequence
                     args, hires = values[:-1], values[-1]
-                    from_script_args(args, hires=hires)
+                    spec = from_script_args(args, hires=hires)
                     sequence += 1
                     return json.dumps(dict(args=args, synthetic=True, sequence=sequence, preparation_calls=list(calls),
+                                           spec=spec, execution_order=[record for stage in STAGES for record in active_passes(spec, stage)],
                                            runtime_mode=setup.mode, manual_imported=manual_imported,
                                            automatic_preparations=automatic_preparations))
 
@@ -186,7 +190,7 @@ function onUiLoaded(callback) {
             assert all(len(item["outputs"]) == len(set(item["outputs"])) for item in config["dependencies"])
             app = gr.mount_gradio_app(app, block, path=route)
         if check:
-            print("CPU_UI_CONFIG_OK: actual Forge entry; English/Chinese; no language control")
+            print("CPU_UI_CONFIG_OK: actual Forge entry; 35 inputs; three tabs; English/Chinese; no language control")
         else:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
                 listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)

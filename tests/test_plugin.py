@@ -69,9 +69,10 @@ class PNGClient:
         self.error = None
         self.mutate = lambda: None
         self.corrupt = lambda result: None
+        self.process_pixels = lambda pixels, params: np.where(pixels >= 128, 224, 16).astype(np.uint8)
 
     def runtime(self, device=None):
-        return dict(ready=True, missing=[], runtime=copy.deepcopy(RUNTIME), runtime_id=RUNTIME["runtime_id"])
+        return dict(ready=True, missing=[], runtime=copy.deepcopy(RUNTIME), runtime_id=RUNTIME["runtime_id"], max_passes=3)
 
     def status(self):
         return dict(instance="shared-test", pid=73, worker_pid=73, busy=False, running=True)
@@ -90,13 +91,19 @@ class PNGClient:
             assert im.info.get("icc_profile"), "input must explicitly be sRGB"
             a = np.asarray(im.convert("RGB"))
         # Nonlinear, so NR(resize(x)) differs from resize(NR(x)).
-        pixels = np.where(a >= 128, 224, 16).astype(np.uint8)
+        pixels = a
+        for params in command.get("passes", [command["params"]]):
+            pixels = self.process_pixels(pixels, params)
         Image.fromarray(pixels).save(out / "output.png")
         progress({"message": "Synthetic NR", "ratio": 1.})
         result = dict(name="output.png", width=a.shape[1], height=a.shape[0], kind="image",
                       params=copy.deepcopy(command["params"]), runtime_id=RUNTIME["runtime_id"],
                       native=dict(hardware_verified=True, gpu_name=RUNTIME["gpu_name"], device="cuda:1"),
                       instance="shared-test", worker_pid=73, preview=False, approximate=False)
+        if "passes" in command:
+            result.update(passes=copy.deepcopy(command["passes"]), completed_passes=len(command["passes"]),
+                          pass_results=[dict(params=copy.deepcopy(params), native=copy.deepcopy(result["native"]))
+                                        for params in command["passes"]])
         self.corrupt(result)
         return result
 
@@ -163,7 +170,198 @@ def output_rgb(result):
     return np.rint((np.moveaxis(np.asarray(result), 1, -1) + 1) / 2 * 255).astype(np.uint8)
 
 
+class ContractTests(unittest.TestCase):
+    def test_three_pages_are_independent_and_stage_order_is_explicit(self):
+        from nr_shared.contract import active_passes, default_passes, execution_summary, make_pass_spec, signature
+        pages = default_passes()
+        for index, record in enumerate(pages):
+            record.update(enabled=True, stage="before_hr" if index == 1 else "after_hr")
+            record["params"]["mix"] = .2 + index * .2
+        spec = make_pass_spec(True, pages, RUNTIME, hires=True)
+        self.assertEqual([record["index"] for record in active_passes(spec, "before_hr")], [2])
+        self.assertEqual([record["index"] for record in active_passes(spec, "after_hr")], [1, 3])
+        before = signature(spec)
+        pages[1]["params"]["mix"] = 1.
+        active_passes(spec)[1]["params"]["mix"] = 0.
+        self.assertEqual(signature(spec), before)
+        summary = execution_summary(spec, 2)
+        self.assertEqual(summary["stage"], "mixed")
+        self.assertEqual([record["index"] for record in summary["passes"]], [2, 1, 3])
+
+    def test_legacy_arguments_round_trip_and_expansion_disables_extra_pages(self):
+        from nr_shared.contract import ARG_KEYS, LEGACY_ARG_KEYS, from_script_args
+        spec = make_spec(True, "before_hr", DEFAULT_PARAMS, RUNTIME, hires=False)
+        legacy = script_args(spec)
+        self.assertEqual(len(legacy), 12)
+        expanded = script_args(spec, expanded=True)
+        self.assertEqual(len(expanded), 35)
+        self.assertEqual(ARG_KEYS[:12], LEGACY_ARG_KEYS)
+        self.assertEqual(expanded[:12], legacy)
+        self.assertIs(expanded[ARG_KEYS.index("pass_2_enabled")], False)
+        self.assertIs(expanded[ARG_KEYS.index("pass_3_enabled")], False)
+        for values in (legacy, expanded):
+            self.assertEqual(from_script_args(values, hires=False), spec)
+            values[0], values[11] = False, None
+            self.assertIsNone(from_script_args(values, hires=False))
+
+    def test_extended_snapshot_freezes_all_three_pages(self):
+        from nr_shared.contract import default_passes, from_script_args, make_pass_spec
+        pages = default_passes()
+        pages[1].update(enabled=True, stage="after_hr")
+        pages[2]["params"]["tone"] = .2
+        spec = make_pass_spec(True, pages, RUNTIME, hires=True)
+        values = script_args(spec)
+        self.assertEqual(from_script_args(values, hires=True), spec)
+        values[11]["gpu_index"] = 0
+        self.assertEqual(spec["runtime"], RUNTIME)
+        self.assertEqual(spec["passes"][2]["params"]["tone"], .2)
+
+    def test_disabled_pages_and_master_never_require_runtime_or_hires(self):
+        from nr_shared.contract import active_passes, default_passes, make_pass_spec
+        pages = default_passes()
+        pages[2]["stage"] = "after_hr"
+        spec = make_pass_spec(True, pages, RUNTIME, hires=False)
+        self.assertEqual(len(active_passes(spec)), 1)
+        self.assertEqual(pages[1]["params"]["mix"], 1.)
+        pages[0]["enabled"] = False
+        self.assertIsNone(make_pass_spec(True, pages, None, hires=False))
+        self.assertIsNone(make_pass_spec(False, None, None, hires=False))
+
+    def test_invalid_pages_and_enabled_after_hr_without_hires_are_rejected(self):
+        from nr_shared.contract import default_passes, make_pass_spec, validate_pass_params, validate_passes
+        pages = default_passes()
+        for invalid in ([], pages * 2, {}, [dict(enabled=1, stage="before_hr", params={})],
+                        [dict(enabled=True, stage="before_hr", params={}, runtime=RUNTIME)]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_passes(invalid)
+        for invalid in ([], [DEFAULT_PARAMS] * 4, [dict(DEFAULT_PARAMS, mix=float("nan"))]):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_pass_params(invalid)
+        pages[1].update(enabled=True, stage="after_hr")
+        with self.assertRaisesRegex(ValueError, "高清"):
+            make_pass_spec(True, pages, RUNTIME, hires=False)
+
+    def test_receipt_requires_every_enabled_page_and_image_count(self):
+        from nr_shared.contract import PROTOCOL, default_passes, execution_summary, make_pass_spec, signature
+        pages = default_passes()
+        pages[1]["enabled"] = True
+        spec = make_pass_spec(True, pages, RUNTIME, hires=False)
+        record = dict(protocol=PROTOCOL, status="done", signature=signature(spec), count=2,
+                      **execution_summary(spec, 2))
+        info = {"extra_generation_params": {SCRIPT_TITLE: record}}
+        self.assertEqual(validate_receipt(info, spec, 2)["count"], 2)
+        record["passes"][1]["count"] = 1
+        with self.assertRaises(ValueError):
+            validate_receipt(info, spec, 2)
+
+
 class WrapperTests(unittest.TestCase):
+    def test_legacy_worker_multipass_is_rejected_before_sampling(self):
+        from nr_shared.contract import default_passes, make_pass_spec
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            client = PNGClient()
+            processing, _, _, _, _, _ = host(client, directory, hires=False)
+            pages = default_passes()
+            pages[1]["enabled"] = True
+            processing.script_args = [0, *script_args(make_pass_spec(True, pages, RUNTIME, hires=False))]
+            processing.scripts.alwayson_scripts[0].args_to = len(processing.script_args)
+            status = client.runtime()
+            status.pop("max_passes")
+            with patch.object(client, "runtime", return_value=status), self.assertRaisesRegex(RuntimeError, "多页支持"):
+                processing.sample()
+            self.assertEqual(processing.native_calls, 0)
+            self.assertEqual(client.commands, [])
+
+    def test_three_pages_split_stages_follow_page_order_and_keep_image_count(self):
+        from nr_shared.contract import default_passes, make_pass_spec
+        for latent in (False, True):
+            with self.subTest(latent=latent), tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                client = PNGClient()
+                client.process_pixels = lambda pixels, params: np.clip(
+                    np.rint(pixels.astype(np.float32) * (.5 + .2 * params["style"]) + 20 * params["tone"]),
+                    0, 255).astype(np.uint8)
+                processing, _, rgb, _, _, _ = host(client, directory, latent=latent)
+                pages = default_passes()
+                for index, record in enumerate(pages):
+                    record.update(enabled=True, stage="before_hr" if index == 1 else "after_hr")
+                    record["params"].update(style=index, tone=.4 + index * .3)
+                spec = make_pass_spec(True, pages, RUNTIME, hires=True)
+                processing.script_args = [0, *script_args(spec)]
+                processing.scripts.alwayson_scripts[0].args_to = len(processing.script_args)
+                expected = client.process_pixels(rgb, pages[1]["params"])
+                expected = np.minimum(np.asarray(Image.fromarray(expected).resize((5, 4),
+                    Image.Resampling.BILINEAR)).astype(int) + 24, 255).astype(np.uint8)
+                for index in (0, 2):
+                    expected = client.process_pixels(expected, pages[index]["params"])
+                np.testing.assert_array_equal(output_rgb(processing.sample())[0], expected)
+                self.assertEqual(len(client.commands), 2)
+                self.assertEqual(client.commands[0]["params"], pages[1]["params"])
+                self.assertEqual(client.commands[1]["passes"], [pages[0]["params"], pages[2]["params"]])
+                receipt = validate_receipt({"extra_generation_params": processing.extra_generation_params}, spec, 1)
+                self.assertEqual([record["index"] for record in receipt["passes"]], [2, 1, 3])
+
+    def test_multipass_batch_snapshot_ignores_midrun_control_edits(self):
+        from nr_shared.contract import ARG_KEYS, default_passes, make_pass_spec
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            client = PNGClient()
+            processing, _, _, _, _, _ = host(client, directory)
+            pages = default_passes()
+            pages[1].update(enabled=True, stage="after_hr")
+            pages[2]["enabled"] = True
+            spec = make_pass_spec(True, pages, RUNTIME, hires=True)
+            processing.script_args = [0, *script_args(spec)]
+            processing.scripts.alwayson_scripts[0].args_to = len(processing.script_args)
+            processing.pixels = tensor(np.concatenate([processing.pixels, 1 - processing.pixels]))
+            processing.n_iter = 2
+            client.mutate = lambda: processing.script_args.__setitem__(1 + ARG_KEYS.index("pass_2_enabled"), False)
+            processing.sample()
+            processing.iteration = 1
+            processing.sample()
+            receipt = validate_receipt({"extra_generation_params": processing.extra_generation_params}, spec, 4)
+            self.assertEqual(len(client.commands), 8)
+            self.assertEqual([record["count"] for record in receipt["passes"]], [4, 4, 4])
+            self.assertEqual([record["index"] for record in receipt["passes"]], [1, 3, 2])
+
+    def test_disabled_middle_page_is_skipped_and_all_disabled_is_passthrough(self):
+        from nr_shared.contract import ARG_KEYS, default_passes, make_pass_spec
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            client = PNGClient()
+            processing, _, _, _, _, _ = host(client, directory, hires=False)
+            pages = default_passes()
+            pages[2]["enabled"] = True
+            spec = make_pass_spec(True, pages, RUNTIME, hires=False)
+            processing.script_args = [0, *script_args(spec)]
+            processing.scripts.alwayson_scripts[0].args_to = len(processing.script_args)
+            processing.sample()
+            self.assertEqual(len(client.commands[0]["passes"]), 2)
+            receipt = validate_receipt({"extra_generation_params": processing.extra_generation_params}, spec, 1)
+            self.assertEqual([record["index"] for record in receipt["passes"]], [1, 3])
+            for index in (1, 3):
+                processing.script_args[1 + ARG_KEYS.index(f"pass_{index}_enabled")] = False
+            with patch.object(client, "runtime", side_effect=AssertionError("All disabled must not contact NR")):
+                processing.sample()
+            self.assertEqual(len(client.commands), 1)
+            self.assertNotIn(SCRIPT_TITLE, processing.extra_generation_params)
+
+    def test_missing_or_wrong_later_pass_evidence_never_issues_receipt(self):
+        from nr_shared.contract import default_passes, make_pass_spec
+        corruptions = [lambda result: result.update(completed_passes=1),
+                       lambda result: result["pass_results"][1]["native"].update(device="cuda:0"),
+                       lambda result: result["pass_results"][1]["params"].update(tone=0)]
+        for corrupt in corruptions:
+            with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+                client = PNGClient()
+                client.corrupt = corrupt
+                processing, _, _, _, _, _ = host(client, directory, hires=False)
+                pages = default_passes()
+                pages[1]["enabled"] = True
+                spec = make_pass_spec(True, pages, RUNTIME, hires=False)
+                processing.script_args = [0, *script_args(spec)]
+                processing.scripts.alwayson_scripts[0].args_to = len(processing.script_args)
+                with self.assertRaisesRegex(RuntimeError, "全部启用页"):
+                    processing.sample()
+                self.assertNotIn(SCRIPT_TITLE, processing.extra_generation_params)
+
     def test_anima_qwen_vae_single_frame_pixels_not_video_or_channel_axis(self):
         for hires in (False, True):
             with self.subTest(hires=hires), tempfile.TemporaryDirectory(dir=ROOT) as directory:
@@ -425,6 +623,51 @@ class WrapperTests(unittest.TestCase):
 
 
 class XYZTests(unittest.TestCase):
+    def test_three_page_preset_freezes_pages_and_legacy_load_clears_extra_pages(self):
+        from nr_shared.contract import ARG_KEYS, default_passes, from_script_args, make_pass_spec
+        from forge_nr.controls import Presets, preset_passes
+        from forge_nr.xyz import PresetAxis
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            presets = Presets(Path(directory) / "presets")
+            pages = default_passes()
+            pages[0]["enabled"] = False
+            pages[1].update(enabled=True, stage="after_hr")
+            pages[1]["params"]["tone"] = .4
+            pages[2]["enabled"] = True
+            presets.save_passes("chain", pages)
+            presets.save("legacy", "before_hr", {**DEFAULT_PARAMS, "mix": .3})
+            axis = PresetAxis(presets)
+            parent, _, _, _, _, _ = host(PNGClient(), directory)
+            parent.script_args = [0, *script_args(make_pass_spec(True, pages, RUNTIME, hires=True))]
+            parent.scripts.alwayson_scripts[0].args_to = len(parent.script_args)
+            parent.script_args[1] = False
+            original = copy.deepcopy(parent.script_args)
+            axis.confirm(parent, ["chain", "legacy"])
+            pages[1]["params"]["tone"] = 1.7
+            presets.save_passes("chain", pages)
+            cell = copy.copy(parent)
+            axis.apply(cell, "chain", ["chain"])
+            self.assertIs(cell.script_args[1], False)
+            self.assertEqual(cell.script_args[1 + ARG_KEYS.index("pass_2_tone")], .4)
+            self.assertEqual(cell.script_args[12], RUNTIME)
+            self.assertEqual(parent.script_args, original)
+            cell.script_args[1] = True
+            spec = from_script_args(cell.script_args[1:], hires=True)
+            self.assertFalse(spec["passes"][0]["enabled"])
+            axis.apply(cell, "legacy", ["legacy"])
+            loaded = from_script_args(cell.script_args[1:], hires=True)
+            self.assertEqual(loaded["params"]["mix"], .3)
+            self.assertNotIn("passes", loaded)
+            self.assertFalse(cell.script_args[1 + ARG_KEYS.index("pass_2_enabled")])
+            self.assertFalse(cell.script_args[1 + ARG_KEYS.index("pass_3_enabled")])
+            copied = preset_passes(presets.load("chain"))
+            copied[2]["params"]["mix"] = 0
+            self.assertEqual(presets.load("chain")["passes"][2]["params"]["mix"], 1.)
+            cell.enable_hr = False
+            axis.apply(cell, "chain", ["chain"])
+            self.assertTrue(all(record["stage"] == "before_hr"
+                                for record in from_script_args(cell.script_args[1:], hires=False)["passes"]))
+
     def axes(self, directory):
         import ast
         from forge_nr.controls import Presets
@@ -670,7 +913,7 @@ class ControlTests(unittest.TestCase):
                 self.events["click"] = (fn, inputs or [], outputs or [])
 
             def change(self, fn, inputs=None, outputs=None, **kwargs):
-                self.events["change"] = (fn, inputs or [], outputs or [])
+                self.events.setdefault("change", []).append((fn, inputs or [], outputs or []))
 
             def input(self, fn, inputs=None, outputs=None, **kwargs):
                 self.events["input"] = (fn, inputs or [], outputs or [])
@@ -679,17 +922,18 @@ class ControlTests(unittest.TestCase):
                 self.events["load"] = (fn, inputs or [], outputs or [])
 
             def fire(self, event):
-                fn, inputs, outputs = self.events[event]
-                result = fn(*(x.value for x in inputs))
-                if len(outputs) == 1:
-                    result = [result]
-                for component, value in zip(outputs, result):
-                    if isinstance(value, dict) and value.get("__type__") == "update":
-                        for name, val in value.items():
-                            if name != "__type__":
-                                setattr(component, name, val)
-                    else:
-                        component.value = value
+                events = self.events[event] if isinstance(self.events[event], list) else [self.events[event]]
+                for fn, inputs, outputs in events:
+                    result = fn(*(component.value for component in inputs))
+                    if len(outputs) == 1:
+                        result = [result]
+                    for component, value in zip(outputs, result):
+                        if isinstance(value, dict) and value.get("__type__") == "update":
+                            for name, val in value.items():
+                                if name != "__type__":
+                                    setattr(component, name, val)
+                        else:
+                            component.value = value
 
         class Gradio:
             Error = RuntimeError
@@ -738,7 +982,11 @@ class ControlTests(unittest.TestCase):
             self.assertEqual([x.elem_id for x in controls], ["forge_nr-checkbox", *["forge_nr_" + key for key in ARG_KEYS[1:]]])
             block.fire("load")
             self.assertEqual(service.enumerations, 0)
-            self.assertEqual(json.loads(controls[-1].value), RUNTIME)
+            self.assertEqual(json.loads(controls[11].value), RUNTIME)
+            self.assertEqual(len(controls), 35)
+            self.assertEqual([gr.by_id[f"forge_nr_pass_{index}_enabled"].value for index in range(1, 4)],
+                             [True, False, False])
+            self.assertTrue(all(f"forge_nr_tab_{index}" in gr.by_id for index in range(1, 4)))
             self.assertIn(RUNTIME["gpu_name"], gr.by_id["forge_nr_environment"].value)
             before_language = copy.deepcopy([control.value for control in controls])
             self.assertNotIn("forge_nr_language", gr.by_id)
@@ -769,7 +1017,31 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(controls[4].value, DEFAULT_PARAMS["intensity"])
             self.assertEqual(controls[1].value, "before_hr")
             self.assertTrue(controls[0].value)
-            self.assertEqual(json.loads(controls[-1].value), RUNTIME)
+            self.assertEqual(json.loads(controls[11].value), RUNTIME)
+            gr.by_id["forge_nr_mix"].value = .3
+            gr.by_id["forge_nr_copy_pass_2"].fire("click")
+            self.assertEqual(gr.by_id["forge_nr_pass_2_mix"].value, .3)
+            self.assertFalse(gr.by_id["forge_nr_pass_2_enabled"].value)
+            self.assertEqual(gr.by_id["forge_nr_pass_3_mix"].value, 1.)
+            gr.by_id["forge_nr_pass_2_enabled"].value = True
+            gr.by_id["forge_nr_pass_3_enabled"].value = True
+            gr.by_id["forge_nr_pass_2_tone"].value = .7
+            hr.value = True
+            hr.fire("change")
+            gr.by_id["forge_nr_pass_3_stage"].value = "after_hr"
+            gr.by_id["forge_nr_preset_name"].value = "three-pages"
+            gr.by_id["forge_nr_save_preset"].fire("click")
+            gr.by_id["forge_nr_pass_2_tone"].value = 1.8
+            gr.by_id["forge_nr_pass_3_enabled"].value = False
+            gr.by_id["forge_nr_load_preset"].fire("click")
+            spec = from_script_args([control.value for control in controls], hires=True)
+            self.assertEqual(spec["passes"][1]["params"]["tone"], .7)
+            self.assertTrue(spec["passes"][2]["enabled"])
+            self.assertEqual(spec["passes"][2]["stage"], "after_hr")
+            hr.value = False
+            hr.fire("change")
+            self.assertTrue(all(gr.by_id["forge_nr_" + prefix + "stage"].value == "before_hr"
+                                for prefix in ("", "pass_2_", "pass_3_")))
             service.failed = True
             gr.by_id["forge_nr_device"].fire("input")
             self.assertEqual(gr.by_id["forge_nr_device"].value, "cuda:1")
@@ -819,14 +1091,14 @@ class ControlTests(unittest.TestCase):
                                 block=prepared_block, localization="zh_CN", setup=setup)
             setup.ensure.side_effect = DownloadError("source_missing", "No publisher source")
             prepared_block.fire("load")
-            self.assertEqual(prepared[-1].value, "{}")
+            self.assertEqual(prepared[11].value, "{}")
             self.assertIn("下载源", prepared_gr.by_id["forge_nr_setup_message"].value)
             self.assertNotIn("forge_nr_permission", prepared_gr.by_id)
             self.assertEqual(prepared_gr.by_id["forge_nr_runtime_file"].kind, "File")
             setup.ensure.side_effect = None
             prepared_gr.by_id["forge_nr_prepare_runtime"].fire("click")
             self.assertFalse(setup.ensure.call_args.kwargs["repair"])
-            self.assertEqual(json.loads(prepared[-1].value), RUNTIME)
+            self.assertEqual(json.loads(prepared[11].value), RUNTIME)
             self.assertIn("检测完成", prepared_gr.by_id["forge_nr_environment"].value)
             service.repair.assert_not_called()
             setup.ensure.side_effect = DownloadError("dependencies_failed", "Raw pip command must stay in details")
@@ -842,7 +1114,7 @@ class ControlTests(unittest.TestCase):
             service.start.side_effect = lambda: setattr(service, "failed", False)
             prepared_gr.by_id["forge_nr_import_runtime"].fire("click")
             setup.import_runtime.assert_called_once_with("selected-runtime.dll")
-            self.assertEqual(json.loads(prepared[-1].value), RUNTIME)
+            self.assertEqual(json.loads(prepared[11].value), RUNTIME)
             self.assertIn("准备好", prepared_gr.by_id["forge_nr_environment"].value)
             self.assertEqual(prepared_gr.by_id["forge_nr_setup_details"].value, "")
             from forge_nr.lifecycle import RepairBlocked
@@ -859,14 +1131,14 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(prepared_gr.by_id["forge_nr_runtime_location"].value, str(setup.runtime_dir))
             self.assertIn("不会下载", prepared_gr.by_id["forge_nr_runtime_note"].value)
             self.assertIn("未验证发布者签名", prepared_gr.by_id["forge_nr_environment"].value)
-            self.assertEqual(len(prepared), 12)
+            self.assertEqual(len(prepared), 35)
             prepared_gr.by_id["forge_nr_runtime_mode"].value = "auto"
             prepared_gr.by_id["forge_nr_runtime_location"].value = "stale initial render"
             prepared_block.fire("load")
             self.assertEqual(prepared_gr.by_id["forge_nr_runtime_mode"].value, "manual")
             self.assertEqual(prepared_gr.by_id["forge_nr_runtime_location"].value, str(setup.runtime_dir))
             self.assertIn("不会下载", prepared_gr.by_id["forge_nr_runtime_note"].value)
-            self.assertEqual(len(prepared), 12)
+            self.assertEqual(len(prepared), 35)
 
     def test_entry_reads_forge_localization_without_an_independent_setting(self):
         import ast
@@ -938,7 +1210,7 @@ class ControlTests(unittest.TestCase):
             self.assertFalse(controls[0].accordion.open)
             args = [component.preprocess(component.value) for component in controls]
             args[0] = True
-            args[-1] = json.dumps(RUNTIME)
+            args[11] = json.dumps(RUNTIME)
             self.assertEqual(from_script_args(args, hires=False)["params"], DEFAULT_PARAMS)
             config = block.get_config_file()
             self.assertEqual(sum(item["props"].get("elem_id") == "forge_nr-checkbox" for item in config["components"]), 1)

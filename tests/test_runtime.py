@@ -1,12 +1,17 @@
 """No GPU or proprietary binaries; fixtures are CPU-only inputs."""
+from copy import deepcopy
 import hashlib
 import json
 import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
+
+import numpy as np
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -256,6 +261,127 @@ class RuntimeTests(unittest.TestCase):
         config = settings.get("nr")
         result = RuntimeFiles()(config, force=True)
         self.assertFalse(any("物理设备核对接口" in message for message in result["missing"]), result["missing"])
+
+
+class AdditiveNative:
+    def __init__(self):
+        self.begins = []
+        self.calls = []
+
+    def begin(self, runtime, params, *, source_key, temporal):
+        self.begins.append((deepcopy(params), source_key, temporal))
+        return dict(warnings=["Synthetic CPU output, not NR"])
+
+    def process(self, pixels, *, params, reset, temporal):
+        self.calls.append((pixels.copy(), deepcopy(params), reset, temporal))
+        return pixels + np.array([16, 32, 48], dtype=np.float32) / np.float32(255)
+
+
+class WorkerPassTests(unittest.TestCase):
+    def setUp(self):
+        from nr_shared.contract import DEFAULT_PARAMS
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT)
+        self.addCleanup(self.temp.cleanup)
+        self.directory = Path(self.temp.name)
+        self.source = self.directory / "source.png"
+        Image.new("RGB", (16, 8), (32, 64, 96)).save(self.source)
+        self.params = deepcopy(DEFAULT_PARAMS)
+
+    def command(self, **updates):
+        result = dict(op="run", id="cpu-pass-test", source_path=str(self.source),
+                      output_dir=str(self.directory / "output"), source=dict(id="cpu-source", sha256="synthetic"),
+                      params=deepcopy(self.params), start=0, end=0, preview_kind="", max_edge=0,
+                      runtime=dict(bridge=str(self.directory / "missing.dll"), runtime_dir=str(self.directory),
+                                   gpu_index=0, device="cuda:1", gpu_name="CPU fixture", channel_order="RGBA",
+                                   runtime_id="a" * 64))
+        result.update(updates)
+        return result
+
+    def test_same_and_different_passes_keep_float_intermediates(self):
+        from nr_runtime.nr_worker import NativeSession
+        scenarios = {
+            "same": [dict(self.params, mix=.2) for index in range(3)],
+            "different": [dict(self.params, style=index, preset=index, tone=.5 + index * .2, mix=mix)
+                          for index, mix in enumerate((.1, .35, .6))],
+        }
+        for name, passes in scenarios.items():
+            with self.subTest(name=name):
+                native = AdditiveNative()
+                events = []
+                output = self.directory / name
+                result = NativeSession(native=native).run(
+                    self.command(params=passes[0], passes=passes, output_dir=str(output)), events.append, threading.Event())
+                self.assertEqual(result["completed_passes"], 3)
+                self.assertEqual(result["passes"], passes)
+                self.assertEqual([record["params"] for record in result["pass_results"]], passes)
+                self.assertEqual(len({record[1] for record in native.begins}), 3)
+                expected = np.full((8, 16, 3), [32, 64, 96], dtype=np.float32) / np.float32(255)
+                for index, params in enumerate(passes):
+                    pixels, actual_params, reset, temporal = native.calls[index]
+                    np.testing.assert_allclose(pixels, expected, rtol=0, atol=1e-7)
+                    self.assertEqual(actual_params, params)
+                    self.assertEqual((reset, temporal), (True, False))
+                    neural = np.clip(expected + np.array([16, 32, 48], dtype=np.float32) / np.float32(255), 0, 1)
+                    expected = expected + (neural - expected) * np.float32(params["mix"])
+                with Image.open(output / "output.png") as image:
+                    np.testing.assert_array_equal(np.asarray(image), np.rint(expected * 255).astype(np.uint8))
+                self.assertEqual(result["files"], ["output.png"])
+                ratios = [event["ratio"] for event in events]
+                self.assertEqual(ratios, sorted(ratios))
+                self.assertEqual(ratios[-1], 1.)
+
+    def test_second_pass_failure_or_cancel_never_publishes_partial_output(self):
+        from nr_runtime.nr_worker import NativeSession
+        for failure in (True, False):
+            with self.subTest(failure=failure):
+                canceled = threading.Event()
+
+                class ControlledNative(AdditiveNative):
+                    def process(self, pixels, **kwargs):
+                        result = super().process(pixels, **kwargs)
+                        if len(self.calls) == 2:
+                            if failure:
+                                raise RuntimeError("Second pass deliberately failed")
+                            canceled.set()
+                        return result
+
+                native = ControlledNative()
+                with self.assertRaises(RuntimeError):
+                    NativeSession(native=native).run(self.command(passes=[deepcopy(self.params) for index in range(3)]),
+                                                     lambda event: None, canceled)
+                self.assertEqual(len(native.calls), 2)
+                self.assertFalse((self.directory / "output/output.png").exists())
+
+    def test_invalid_passes_are_rejected_before_native(self):
+        from nr_runtime.nr_worker import NativeSession
+        changes = [dict(passes=[]), dict(passes=[self.params] * 4), dict(passes=[dict(self.params, mix=.5)]),
+                   dict(passes=[self.params], preview_kind="still"), dict(passes=[self.params], start=1),
+                   dict(passes=[dict(self.params, unknown=True)])]
+        for update in changes:
+            with self.subTest(update=update):
+                native = AdditiveNative()
+                with self.assertRaises(ValueError):
+                    NativeSession(native=native).run(self.command(**update), lambda event: None, threading.Event())
+                self.assertEqual(native.begins, [])
+
+    def test_video_multipass_is_rejected_before_native(self):
+        from nr_runtime.nr_worker import NativeSession
+        native = AdditiveNative()
+        with patch("nr_runtime.nr_media.source_facts", return_value={"kind": "video"}), self.assertRaisesRegex(ValueError, "still"):
+            NativeSession(native=native).run(self.command(passes=[self.params]), lambda event: None, threading.Event())
+        self.assertEqual(native.begins, [])
+
+    def test_legacy_preview_remains_single_pass(self):
+        from nr_runtime.nr_worker import NativeSession
+        native = AdditiveNative()
+        result = NativeSession(native=native).run(self.command(preview_kind="still", params=dict(self.params, mix=.25)),
+                                                 lambda event: None, threading.Event())
+        self.assertNotIn("passes", result)
+        self.assertEqual(len(native.calls), 1)
+        self.assertEqual(native.calls[0][2:], (True, False))
+        self.assertEqual(result["files"], ["output.png", "original.png", "neural.png"])
+        with Image.open(self.directory / "output/output.png") as image:
+            np.testing.assert_array_equal(np.asarray(image)[0, 0], [36, 72, 108])
 
 
 if __name__ == "__main__":

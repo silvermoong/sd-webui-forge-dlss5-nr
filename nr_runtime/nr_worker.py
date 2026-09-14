@@ -12,6 +12,7 @@ import threading
 from . import nr_media
 from .nr_media import inspect_media, check_cancel, MediaError
 from .nr_native import NativeError, readiness
+from nr_shared.contract import validate_pass_params
 
 DEFAULT_PARAMS = dict(style=1, preset=3, intensity=1., tone=1., structure=1., skin=-1.,
                       auto_mask=False, mix=1., flow=True)
@@ -41,11 +42,15 @@ def validate_command(command):
     if not isinstance(command.get("id"), str) or not 0 < len(command["id"]) <= 128:
         raise ValueError("A nonempty request id of at most 128 characters is required")
     allowed = {"op", "id", "source_path", "output_dir", "source", "params", "start", "end",
-               "preview_kind", "max_edge", "runtime"}
+               "preview_kind", "max_edge", "runtime", "passes"}
     if set(command) - allowed:
         raise ValueError("Unknown NR run fields")
     result = copy.deepcopy(command)
     result["params"] = validate_params(command.get("params", {}))
+    if "passes" in command:
+        result["passes"] = validate_pass_params(command["passes"])
+        if result["params"] != result["passes"][0]:
+            raise ValueError("NR params must match the first pass")
     for key in ("start", "end"):
         value = command.get(key, 0)
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -56,6 +61,8 @@ def validate_command(command):
     preview = result.setdefault("preview_kind", "")
     if preview not in ("", "still", "clip"):
         raise ValueError("preview_kind must be empty, still or clip")
+    if "passes" in result and (preview or result["start"] or result["end"]):
+        raise ValueError("NR multipass requires a full still image")
     edge = result.setdefault("max_edge", 0)
     if type(edge) is not int or not 0 <= edge <= 16384 or (not preview and edge):
         raise ValueError("max_edge is a preview-only integer; final output requires 0")
@@ -83,7 +90,7 @@ class NativeSession:
     def __init__(self, native=None):
         self.native = native
 
-    def _begin(self, command, *, temporal):
+    def _begin(self, command, *, temporal, pass_index=None):
         if self.native is None:
             status = readiness(command["runtime"])
             if not status["ready"]:
@@ -92,6 +99,8 @@ class NativeSession:
             self.native = NativeDriver()
         source = command["source"]
         key = (source.get("id"), source.get("sha256"), command["source_path"])
+        if pass_index is not None:
+            key += (pass_index,)
         return self.native.begin(command["runtime"], command["params"], source_key=key, temporal=temporal)
 
     def _frame(self, original, params, cancel_event, *, reset, temporal):
@@ -124,6 +133,8 @@ class NativeSession:
         if facts is None:
             facts = inspect_media(command["source_path"], cancel_event=cancel_event, progress=progress)
         if facts["kind"] != "image":
+            if "passes" in command:
+                raise ValueError("NR multipass only supports still images")
             return nr_media.process_video(command, facts=facts,
                                            native_begin=lambda **kw: self._begin(command, **kw),
                                            process_frame=lambda rgb, **kw: self._frame(rgb, command["params"], cancel_event, **kw),
@@ -133,20 +144,32 @@ class NativeSession:
         image = nr_media.read_image(command["source_path"], max_edge=command["max_edge"])
         original = image["rgb"]
         check_cancel(cancel_event)
-        native_info = self._begin(command, temporal=False) or {}
-        progress("Processing SDR still image", 0.)
-        neural, mixed = self._frame(original, command["params"], cancel_event, reset=True, temporal=False)
+        passes = command.get("passes", [command["params"]])
+        mixed = original
+        pass_results = []
+        warnings = list(image["warnings"])
+        for index, params in enumerate(passes):
+            check_cancel(cancel_event)
+            native_info = self._begin(dict(command, params=params), temporal=False,
+                                      pass_index=index if "passes" in command else None) or {}
+            message = f"Processing NR pass {index + 1}/{len(passes)}" if "passes" in command else "Processing SDR still image"
+            progress(message, index / len(passes))
+            neural, mixed = self._frame(mixed, params, cancel_event, reset=True, temporal=False)
+            pass_results.append(dict(params=copy.deepcopy(params), native=copy.deepcopy(native_info)))
+            warnings.extend(native_info.get("warnings", []))
         height, width = original.shape[:2]
         preview = bool(command["preview_kind"])
         approximate = (width, height) != (facts["width"], facts["height"])
         names = ["output.png", "original.png", "neural.png"] if preview else ["output.png"]
         result = dict(name="output.png", kind="image", width=width, height=height, duration=0., frames=1,
-                      fps=None, files=names, warnings=[*image["warnings"], *native_info.get("warnings", [])],
+                      fps=None, files=names, warnings=list(dict.fromkeys(warnings)),
                       parent=command["source"], params=command["params"], runtime_id=command["runtime"].get("runtime_id", ""),
                       selection=dict(start=0., end=0.), preview=preview, approximate=approximate,
                       note="缩小预览（近似，不裁切）" if approximate else "原尺寸；首帧清空历史",
                       color_space="srgb", mix_space="display-encoded sRGB float32",
                       native=native_info)
+        if "passes" in command:
+            result.update(passes=copy.deepcopy(passes), completed_passes=len(pass_results), pass_results=pass_results)
         if preview:
             result.update(original_name="original.png", neural_name="neural.png")
         output = Path(command["output_dir"])

@@ -1,8 +1,11 @@
 """Private startup and process ownership checks; no network or GPU."""
+from copy import deepcopy
+import hashlib
 import os
 from pathlib import Path
 import socket
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -58,6 +61,7 @@ main()
             self.assertFalse(client.status()["running"])
             runtime = client.runtime()
             self.assertFalse(runtime["ready"])
+            self.assertEqual(runtime["max_passes"], 3)
             self.assertTrue(runtime["missing"])
             self.assertFalse(client.status()["pid"])
             self.assertIsNone(process.poll())
@@ -82,6 +86,38 @@ main()
         host.close()
         host.close()
         worker.close.assert_called_once_with()
+
+    def test_host_freezes_multipass_and_rejects_invalid_chain_before_worker(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from nr_shared.contract import DEFAULT_PARAMS
+        from nr_shared.host import Host
+        with tempfile.TemporaryDirectory(dir=ROOT) as directory:
+            root = Path(directory)
+            request = root / "tmp/nr-fixture"
+            request.mkdir(parents=True)
+            source = request / "input.png"
+            source.write_bytes(b"CPU fixture; not processed")
+            (request / "output").mkdir()
+            runtime = dict(bridge="CPU-bridge", runtime_dir="CPU-runtime", gpu_index=0, device="cuda:1",
+                           gpu_name="CPU fixture", channel_order="RGBA", runtime_id="a" * 64)
+            worker = SimpleNamespace(close=Mock(), run=Mock())
+            host = Host(root, worker, catalog=object())
+            try:
+                command = dict(op="run", id="cpu-chain", source_path=str(source), output_dir=str(request / "output"),
+                               source=dict(id="cpu-source", sha256=hashlib.sha256(source.read_bytes()).hexdigest()),
+                               params=deepcopy(DEFAULT_PARAMS), runtime=runtime, start=0, end=0, preview_kind="", max_edge=0)
+                for passes in ([], [DEFAULT_PARAMS] * 4, [dict(DEFAULT_PARAMS, mix=.4)]):
+                    with self.subTest(passes=passes), self.assertRaises((ValueError, SharedError)):
+                        host._command(dict(command, passes=passes))
+                command["passes"] = [deepcopy(DEFAULT_PARAMS), dict(DEFAULT_PARAMS, style=2, mix=.4)]
+                frozen = host._command(command)
+                command["passes"][1]["mix"] = 1.
+                self.assertEqual(frozen["passes"][1]["mix"], .4)
+                self.assertEqual(host.mode, "private")
+                worker.run.assert_not_called()
+            finally:
+                host.close()
 
     def test_starts_only_its_private_transport_without_discovery_or_network(self):
         transport = Transport()

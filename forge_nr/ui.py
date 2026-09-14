@@ -1,7 +1,8 @@
 """Actual txt2img controls; exactly contract.ARG_KEYS are returned to Forge."""
 import json
 
-from nr_shared.contract import ARG_KEYS, DEFAULT_PARAMS, PARAM_KEYS, SCRIPT_TITLE, validate_runtime
+from nr_shared.contract import ARG_KEYS, DEFAULT_PARAMS, MAX_PASSES, PARAM_KEYS, PASS_KEYS, SCRIPT_TITLE, validate_passes, validate_runtime
+from .controls import preset_passes
 from .i18n import forge_language, preparation_message, text
 
 STAGES = ("before_hr", "after_hr")
@@ -10,6 +11,8 @@ STAGES = ("before_hr", "after_hr")
 def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, localization=None, setup=None):
     language = forge_language(localization)
     controls = {}
+    pages = []
+    copy_buttons = []
 
     def component(kind, key, translation=None, property="label", **kwargs):
         if translation:
@@ -38,24 +41,33 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
                 runtime_location = component("Textbox", "runtime_location", "runtime_location", value=str(setup.runtime_dir), interactive=False)
                 setup_message = component("Markdown", "setup_message", value=text("preparing", language))
                 prepare_button = component("Button", "prepare_runtime", "prepare", property="value")
-        stage = component("Radio", "stage", label=text("stage", language), value="before_hr",
-                          choices=[(text(key, language), key) for key in STAGES[:2 if hr is not None and hr.value else 1]])
+        with gr.Tabs(elem_id="forge_nr_passes"):
+            for index in range(1, MAX_PASSES + 1):
+                prefix = "" if index == 1 else f"pass_{index}_"
+                with gr.Tab(("1st", "2nd", "3rd")[index - 1], id=index, elem_id=f"forge_nr_tab_{index}"):
+                    with gr.Row():
+                        page_enabled = component("Checkbox", f"pass_{index}_enabled",
+                                                 label=text("enable_pass", language, index=index), value=index == 1)
+                        if index > 1:
+                            copy_buttons.append(component("Button", f"copy_pass_{index}", "copy_previous", property="value"))
+                    stage = component("Radio", prefix + "stage", label=text("stage", language), value="before_hr",
+                                      choices=[(text(key, language), key) for key in STAGES[:2 if hr is not None and hr.value else 1]])
+                    with gr.Row():
+                        component("Dropdown", prefix + "style", "style", value=1,
+                                  choices=[(str(number), number) for number in range(3)], type="value")
+                        component("Dropdown", prefix + "preset", "preset", value=3,
+                                  choices=[(str(number), number) for number in range(4)], type="value")
+                    for pair in (("intensity", "tone"), ("structure", "skin")):
+                        with gr.Row():
+                            for key in pair:
+                                component("Slider", prefix + key, key, minimum=-1 if key == "skin" else 0,
+                                          maximum=2, step=0.01, value=DEFAULT_PARAMS[key])
+                    component("Slider", prefix + "mix", "mix", minimum=0, maximum=1, step=0.01, value=1.)
+                    with gr.Row():
+                        component("Checkbox", prefix + "auto_mask", "auto_mask", value=False)
+                        component("Checkbox", prefix + "flow", "flow", value=True)
+                    pages.append([page_enabled, stage, *(controls[prefix + key] for key in PARAM_KEYS)])
         note("behavior")
-        with gr.Row():
-            component("Dropdown", "style", "style", value=1,
-                      choices=[(str(i), i) for i in range(3)], type="value")
-            component("Dropdown", "preset", "preset", value=3,
-                      choices=[(str(i), i) for i in range(4)], type="value")
-        for pair in (("intensity", "tone"), ("structure", "skin")):
-            with gr.Row():
-                for key in pair:
-                    component("Slider", key, key,
-                              minimum=-1 if key == "skin" else 0, maximum=2, step=0.01, value=DEFAULT_PARAMS[key])
-        component("Slider", "mix", "mix",
-                  minimum=0, maximum=1, step=0.01, value=1.)
-        with gr.Row():
-            component("Checkbox", "auto_mask", "auto_mask", value=False)
-            component("Checkbox", "flow", "flow", value=True)
         note("experimental")
 
         with group("presets", open=False):
@@ -145,23 +157,31 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
         except Exception as exc:
             return text("worker_failed", language, error=exc)
 
-    def save_preset(title, where, *values):
+    def save_preset(title, *values):
         try:
-            presets.save(title, where, dict(zip(PARAM_KEYS, values)))
+            records = []
+            for offset in range(0, len(values), len(PASS_KEYS)):
+                record = dict(zip(PASS_KEYS, values[offset:offset + len(PASS_KEYS)]))
+                records.append(dict(enabled=record["enabled"], stage=record["stage"],
+                                    params={key: record[key] for key in PARAM_KEYS}))
+            presets.save_passes(title, validate_passes(records))
             return gr.update(choices=presets.names(), value=title.strip()), text("saved_ok", language)
         except Exception as exc:
             return gr.update(), text("save_failed", language, error=exc)
 
     def load_preset(title, hires=False):
         try:
-            record = presets.load(title)
-            where = record["stage"] if hires else "before_hr"
+            records = preset_passes(presets.load(title))
             message = text("loaded_ok", language)
-            if where != record["stage"]:
+            if not hires and any(record["stage"] == "after_hr" for record in records):
                 message += text("hires_reset", language)
-            return [stage_update(hires, where), *(record["params"][key] for key in PARAM_KEYS), message]
+            values = []
+            for record in records:
+                values.extend([record["enabled"], stage_update(hires, record["stage"]),
+                               *(record["params"][key] for key in PARAM_KEYS)])
+            return [*values, message]
         except Exception as exc:
-            return [*(gr.update() for _ in range(1 + len(PARAM_KEYS))), text("load_failed", language, error=exc)]
+            return [*(gr.update() for _ in range(MAX_PASSES * len(PASS_KEYS))), text("load_failed", language, error=exc)]
 
     def delete_preset(title):
         try:
@@ -251,10 +271,14 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
     enumerate_button.click(enumerate_devices, inputs=[runtime], outputs=[device, environment], **event)
     status_button.click(lambda: backend("status"), outputs=[backend_status], **event)
     release.click(lambda: backend("release"), outputs=[backend_status], **event)
-    save.click(save_preset, inputs=[name, stage, *(controls[key] for key in PARAM_KEYS)], outputs=[saved, preset_message], **event)
+    page_controls = [control for page in pages for control in page]
+    save.click(save_preset, inputs=[name, *page_controls], outputs=[saved, preset_message], **event)
     load.click(load_preset, inputs=[saved, *([hr] if hr is not None else [])],
-               outputs=[stage, *(controls[key] for key in PARAM_KEYS), preset_message], **event)
+               outputs=[*page_controls, preset_message], **event)
     delete.click(delete_preset, inputs=[saved], outputs=[saved, preset_message], **event)
+    for index, button in enumerate(copy_buttons, 1):
+        button.click(lambda where, *values: [gr.update(value=where), *values],
+                     inputs=pages[index - 1][1:], outputs=pages[index][1:], **event)
     if setup is not None:
         preparation_outputs = [device, runtime, environment, setup_message, setup_details]
         runtime_outputs = [runtime_mode, runtime_location, runtime_note, *preparation_outputs]
@@ -264,7 +288,8 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
         repair_button.click(repair_dependencies, inputs=[device], outputs=preparation_outputs, **event)
         import_button.click(import_runtime_file, inputs=[runtime_file, device], outputs=preparation_outputs, **event)
     if hr is not None:
-        hr.change(stage_update, inputs=[hr, stage], outputs=[stage], queue=False, **event)
+        for page in pages:
+            hr.change(stage_update, inputs=[hr, page[1]], outputs=[page[1]], queue=False, **event)
     if block is not None:
         if setup is None:
             block.load(snapshot, inputs=[device], outputs=[device, runtime, environment], **event)

@@ -8,8 +8,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const origin = 'http://127.0.0.1:7875';
 const folder = path.join(root, 'work', `ui-browser-${Date.now()}`);
 await mkdir(folder, {recursive: true});
-const report = {folder, errors: [], viewports: [], languages: []};
-const browser = await chromium.launch({channel: 'msedge', headless: true});
+const report = {folder, errors: [], viewports: [], languages: [], multipass: [], passViewports: []};
+const browser = await chromium.launch({channel: 'msedge', headless: true,
+  args: ['--disable-gpu', '--disable-background-networking', '--disable-component-update', '--disable-sync']});
 const context = await browser.newContext({viewport: {width: 1440, height: 1000}, serviceWorkers: 'block'});
 await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
 const page = await context.newPage();
@@ -27,8 +28,149 @@ async function capture(enabled) {
   }, {sequence, enabled});
   const result = JSON.parse(await page.locator('#fixture_request textarea').inputValue());
   assert.equal(result.synthetic, true);
-  assert.equal(result.args.length, 12);
+  assert.equal(result.args.length, 35);
   return result.args;
+}
+
+async function multipass(locale) {
+  await page.setViewportSize({width: 1440, height: 1000});
+  await page.goto(`${origin}/${locale}/`, {waitUntil: 'load'});
+  const master = page.locator('#forge_nr-visible-checkbox');
+  await master.waitFor({state: 'visible'});
+  await page.waitForFunction(() => document.querySelector('#forge_nr_runtime textarea')?.value.includes('runtime_id'));
+  await page.locator('#forge_nr > .label-wrap').click();
+  await master.uncheck();
+  const tab = index => page.getByRole('tab', {name: ['1st', '2nd', '3rd'][index - 1], exact: true}).click();
+  const enabled = index => page.locator(`#forge_nr_pass_${index}_enabled input[type="checkbox"]`);
+  const key = (index, name) => `forge_nr_${index === 1 ? '' : `pass_${index}_`}${name}`;
+  const snapshot = async () => {
+    await capture(true);
+    return JSON.parse(await page.locator('#fixture_request textarea').inputValue());
+  };
+  const number = async (index, name, value) => {
+    const field = page.locator(`#${key(index, name)} input[type="number"]`);
+    await field.fill(String(value));
+    await field.press('Tab');
+  };
+  const stage = async (index, after) => {
+    const label = locale === 'zh' ? (after ? '高清修复后' : '高清修复前（未开高清：首轮后）') :
+      (after ? 'After Hires. fix' : 'Before Hires. fix (after first pass if Hires is off)');
+    await page.locator(`#${key(index, 'stage')}`).getByRole('radio', {name: label, exact: true}).check();
+  };
+  assert.equal(await enabled(1).isChecked(), true);
+  await tab(2);
+  assert.equal(await enabled(2).isChecked(), false);
+  await tab(3);
+  assert.equal(await enabled(3).isChecked(), false);
+  await tab(1);
+  await master.check();
+  const initial = await snapshot();
+  assert.equal(initial.spec.params.mix, 1);
+  await page.locator('#fixture_hr input[type="checkbox"]').check();
+  const stages = [key(1, 'stage'), key(2, 'stage'), key(3, 'stage')];
+  await page.waitForFunction(ids => ids.every(id =>
+    document.getElementById(id)?.querySelectorAll('input[type="radio"]').length === 2), stages);
+  await number(1, 'tone', .71);
+  await number(1, 'mix', .55);
+  await stage(1, true);
+  await tab(2);
+  await page.locator('#forge_nr_copy_pass_2').click();
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_pass_2_mix input[type="number"]')?.value) === .55);
+  assert.equal(await enabled(2).isChecked(), false);
+  assert.equal(Number(await page.locator('#forge_nr_pass_2_tone input[type="number"]').inputValue()), .71);
+  await enabled(2).check();
+  await number(2, 'tone', .83);
+  await number(2, 'mix', .35);
+  await page.locator('#forge_nr_pass_2_style input').click();
+  await page.getByRole('option', {name: '2', exact: true}).click();
+  await stage(2, false);
+  await tab(3);
+  assert.equal(Number(await page.locator('#forge_nr_pass_3_mix input[type="number"]').inputValue()), 1);
+  await enabled(3).check();
+  await number(3, 'tone', 1.17);
+  await number(3, 'mix', .72);
+  await stage(3, true);
+  let record = await snapshot();
+  assert.deepEqual(record.execution_order.map(pass => pass.index), [2, 1, 3]);
+  assert.deepEqual(record.spec.passes.map(pass => pass.params.tone), [.71, .83, 1.17]);
+  assert.deepEqual(record.spec.passes.map(pass => pass.params.mix), [.55, .35, .72]);
+  await tab(1);
+  await number(1, 'tone', .44);
+  record = await snapshot();
+  assert.deepEqual(record.spec.passes.map(pass => pass.params.tone), [.44, .83, 1.17]);
+  await tab(2);
+  await enabled(2).uncheck();
+  record = await snapshot();
+  assert.deepEqual(record.execution_order.map(pass => pass.index), [1, 3]);
+  assert.equal(record.spec.passes[1].params.style, 2);
+  await enabled(2).check();
+  const saved = await snapshot();
+  await page.getByText(locale === 'zh' ? '本地命名参数预设' : 'Named parameter presets', {exact: true}).click();
+  await page.locator('#forge_nr_preset_name').getByRole('textbox').fill(`three-pages-${locale}`);
+  await page.locator('#forge_nr_save_preset').click();
+  await page.waitForFunction(() => /已保存整组三页|All three tabs saved/.test(
+    document.querySelector('#forge_nr_preset_message textarea')?.value || ''));
+  await tab(3);
+  await number(3, 'mix', .1);
+  await enabled(3).uncheck();
+  await master.uncheck();
+  await page.locator('#forge_nr_load_preset').click();
+  await page.waitForFunction(() => document.querySelector('#forge_nr_pass_3_enabled input')?.checked === true);
+  assert.equal(await master.isChecked(), false);
+  await capture(false);
+  assert.equal(JSON.parse(await page.locator('#fixture_request textarea').inputValue()).spec, null);
+  await master.check();
+  record = await snapshot();
+  assert.deepEqual(record.spec, saved.spec);
+  assert.equal(record.args[11], initial.args[11]);
+  for (const index of [1, 2, 3]) {
+    await tab(index);
+    await enabled(index).uncheck();
+  }
+  assert.equal((await snapshot()).spec, null);
+  await page.locator('#forge_nr_load_preset').click();
+  await page.waitForFunction(() => [1, 2, 3].every(index =>
+    document.querySelector(`#forge_nr_pass_${index}_enabled input`)?.checked === true));
+  assert.deepEqual((await snapshot()).spec, saved.spec);
+  for (const [width, height] of [[1440,1000], [1040,900], [768,900], [390,844], [320,720], [1440,540]]) {
+    await page.setViewportSize({width, height});
+    for (const index of [1, 2, 3]) {
+      await tab(index);
+      const panel = page.locator('#forge_nr_passes');
+      await panel.screenshot({path: path.join(folder, `passes-${locale}-${width}x${height}-${index}.png`), animations: 'disabled'});
+      const geometry = await page.evaluate(() => {
+        const fields = [...document.querySelectorAll('#forge_nr_passes input, #forge_nr_passes button')]
+          .filter(element => element.getClientRects().length && element.getBoundingClientRect().width > 0);
+        return {width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth,
+          overflow: fields.map(element => ({id: element.closest('[id]')?.id,
+            left: element.getBoundingClientRect().left, right: element.getBoundingClientRect().right}))
+            .filter(bounds => bounds.left < -1 || bounds.right > innerWidth + 1),
+          clippedButtons: fields.filter(element => element.tagName === 'BUTTON' && element.scrollWidth > element.clientWidth + 1)
+            .map(element => element.textContent)};
+      });
+      assert.ok(geometry.documentWidth <= geometry.width + 1, `Page overflow at ${locale}/${width}`);
+      assert.deepEqual(geometry.overflow, [], `Controls overflow at ${locale}/${width}/tab${index}`);
+      assert.deepEqual(geometry.clippedButtons, [], `Clipped buttons at ${locale}/${width}/tab${index}`);
+      report.passViewports.push({locale, tab: index, ...geometry});
+    }
+  }
+  await page.locator('#fixture_hr input[type="checkbox"]').uncheck();
+  await page.waitForFunction(ids => ids.every(id =>
+    document.getElementById(id)?.querySelectorAll('input[type="radio"]').length === 1), stages);
+  record = await snapshot();
+  assert.deepEqual(record.spec.passes.map(pass => pass.stage), ['before_hr', 'before_hr', 'before_hr']);
+  assert.deepEqual(record.execution_order.map(pass => pass.index), [1, 2, 3]);
+  await page.locator('#forge_nr_preset_list input').click();
+  await page.getByRole('option', {name: 'legacy-fixture', exact: true}).click();
+  await page.locator('#forge_nr_load_preset').click();
+  await page.waitForFunction(() => document.querySelector('#forge_nr_pass_3_enabled input')?.checked === false);
+  record = await snapshot();
+  assert.equal(record.spec.params.mix, .25);
+  assert.equal(record.spec.stage, 'before_hr');
+  assert.equal(record.execution_order.length, 1);
+  assert.equal(record.args[11], initial.args[11]);
+  report.multipass.push({locale, independentParams: true, disabledSkip: true, allDisabled: true,
+    stageOrder: [2, 1, 3], copyKeepsDisabled: true, presets: true, legacyMigration: true});
 }
 
 try {
@@ -48,7 +190,7 @@ try {
   await page.waitForFunction(() => document.querySelector('#forge_nr_environment')?.innerText.includes('Ready to generate'));
   assert.match(await page.locator('#forge_nr_setup_message').innerText(), /Ready to generate/);
   await page.locator('#forge_nr-visible-checkbox').check();
-  assert.equal((await capture(true)).length, 12);
+  assert.equal((await capture(true)).length, 35);
   assert.deepEqual(JSON.parse(await page.locator('#fixture_request textarea').inputValue()).preparation_calls, [false, false]);
   report.preparationRetry = true;
 
@@ -188,6 +330,7 @@ try {
   report.manualRuntimeUpload = true;
   report.manualModeSurvivesRefresh = true;
   report.manualModeSkipsAutomaticPreparation = true;
+  for (const locale of ['en', 'zh']) await multipass(locale);
   assert.deepEqual(report.errors, []);
   report.passed = true;
 } catch (error) {

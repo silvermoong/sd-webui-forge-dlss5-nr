@@ -2,7 +2,8 @@
 from copy import deepcopy
 from pathlib import Path
 
-from nr_shared.contract import ARG_KEYS, PARAM_KEYS, SCRIPT_TITLE
+from nr_shared.contract import ARG_KEYS, LEGACY_ARG_KEYS, PARAM_KEYS, SCRIPT_TITLE
+from .controls import preset_passes
 
 ENABLED_LABEL = f"[{SCRIPT_TITLE}] Enabled"
 PRESET_LABEL = f"[{SCRIPT_TITLE}] Preset"
@@ -29,12 +30,15 @@ def _update(processing, values):
     source = processing.script_args
     start, end = script.args_from, script.args_to
     if (not isinstance(source, (list, tuple)) or type(start) is not int or type(end) is not int
-            or start < 1 or end > len(source) or end - start != len(ARG_KEYS)):
+            or start < 1 or end > len(source) or end - start not in (len(LEGACY_ARG_KEYS), len(ARG_KEYS))):
         raise RuntimeError("NR XYZ script arguments are incompatible; reload Forge")
+    keys = LEGACY_ARG_KEYS if end - start == len(LEGACY_ARG_KEYS) else ARG_KEYS
+    if set(values) - set(keys):
+        raise RuntimeError("NR multipass preset requires the updated Forge controls; reload Forge")
     arguments = list(source)
     arguments[start:end] = deepcopy(source[start:end])
     for key, value in values.items():
-        arguments[start + ARG_KEYS.index(key)] = value
+        arguments[start + keys.index(key)] = value
     processing.script_args = tuple(arguments) if isinstance(source, tuple) else arguments
     processing.extra_generation_params = dict(processing.extra_generation_params)
 
@@ -68,8 +72,20 @@ class PresetAxis:
         if not isinstance(name, str) or name.strip() not in snapshot:
             raise ValueError("NR preset was not included in the grid snapshot")
         record = deepcopy(snapshot[name.strip()])
-        stage = record["stage"] if processing.enable_hr else "before_hr"
-        _update(processing, {"stage": stage, **{key: record["params"][key] for key in PARAM_KEYS}})
+        passes = preset_passes(record)
+        if not processing.enable_hr:
+            for selected in passes:
+                selected["stage"] = "before_hr"
+        values = {"stage": passes[0]["stage"], **{key: passes[0]["params"][key] for key in PARAM_KEYS}}
+        runner = getattr(processing, "scripts", None)
+        scripts = [script for script in getattr(runner, "alwayson_scripts", ()) if script.title() == SCRIPT_TITLE]
+        modern = len(scripts) == 1 and scripts[0].args_to - scripts[0].args_from == len(ARG_KEYS)
+        if modern or "passes" in record:
+            values["pass_1_enabled"] = passes[0]["enabled"]
+            for index, selected in enumerate(passes[1:], 2):
+                values.update({f"pass_{index}_{key}": value for key, value in
+                               {"enabled": selected["enabled"], "stage": selected["stage"], **selected["params"]}.items()})
+        _update(processing, values)
         processing.extra_generation_params["NR preset"] = name.strip()
 
 

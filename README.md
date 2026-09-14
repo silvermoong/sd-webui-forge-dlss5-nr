@@ -3,8 +3,8 @@
 [简体中文](README.zh-CN.md) | [Runtime / model setup](MODEL_SETUP.md)
 
 An **experimental, unofficial** NVIDIA Neural Rendering extension for **Forge-neo on Windows**.
-Enhance generated still images before or after Hires. fix, with an always-visible header switch,
-named presets and X/Y/Z comparisons. The panel follows Forge's interface language automatically;
+Enhance generated still images with up to three separately configured NR passes before or after Hires. fix,
+with an always-visible header switch, named presets and X/Y/Z comparisons. The panel follows Forge's interface language automatically;
 English and Simplified Chinese are supported, with no separate language selector.
 
 ![English interface in a CPU-only UI fixture](docs/ui-en.png)
@@ -19,11 +19,13 @@ This is not NVIDIA Super Resolution, Ray Reconstruction or a general DLSS SDK in
 ## Features
 
 - Header checkbox: enable/disable NR while the panel is collapsed. Off leaves native generation untouched.
-- Before hires: first pass -> NR -> upscaler -> hires sampling. After hires: both passes -> NR.
-  Without Hires. fix, only the first position is available. Both positions run before ADetailer.
-- Style/preset indices, intensity, tone, structure, skin, automatic mask and a separate output blend.
+- **1st / 2nd / 3rd tabs**, each with its own enable switch, insertion point and parameters. Only the first tab starts enabled.
+- Enabled before-hires tabs run in tab order, followed by upscaling/hires sampling, then enabled after-hires tabs in tab order.
+  Without Hires. fix, only before-hires is available. All NR passes finish before ADetailer.
+- Per-tab style/preset indices, intensity, tone, structure, skin, automatic mask and output blend.
+  Copy the previous tab's parameters without changing this tab's enable switch.
 - Named parameter presets; `[DLSS5 NR] Enabled` and `[DLSS5 NR] Preset` axes in **X/Y/Z plot**.
-  Presets do not implicitly enable NR or select a GPU. Grid presets are frozen before the grid begins.
+  Presets store all three tabs but never change the master switch or GPU. Grid presets are frozen before the grid begins.
 - Explicit physical GPU selection. NR never unloads other applications' models, guesses another GPU or silently reduces quality.
 - A private process isolates native runtime failures and exits with Forge, including abrupt Forge exits on Windows.
 - Automatic-original and manual-custom runtime modes use separate directories. Your manual file is never automatically downloaded or replaced.
@@ -75,7 +77,7 @@ Switching modes and importing files require an idle private controller. Existing
 ## First Test
 
 Use a model and prompt that already generate correctly. Set **512x512, batch size 1, batch count 1**, temporarily disable Hires. fix
-and ADetailer, keep the default NR parameters, enable **DLSS5 NR** in its header and click the usual **Generate** button.
+and ADetailer, keep only **1st** enabled with default parameters, enable **DLSS5 NR** in its header and click the usual **Generate** button.
 
 Success means a normal output image whose generation parameters contain a `DLSS5 NR` receipt with `status: done`.
 File readiness is not GPU/runtime compatibility validation. On failure, disabling DLSS5 NR restores normal generation;
@@ -86,13 +88,35 @@ Dependency repair closes only this extension's confirmed-idle controller before 
 It refuses to run during an NR request or while the controller's state is unknown. Short messages stay at the top;
 original errors are available under **Diagnostic details** in the Advanced section and clear after a successful preparation.
 
+## Three-Pass Setup
+
+After a successful single-pass test, open **2nd** or **3rd**, enable that tab and set its parameters and insertion point.
+Each pass can use the same values or different ones. Switching tabs only changes the editor view; it does not run NR or select which pass executes.
+Disabled tabs keep their values but do not run. Disabling all tabs leaves native generation untouched, even with the master switch on.
+
+The stages determine execution order. For example, with tab 2 before hires and tabs 1 and 3 after hires:
+
+```text
+First sampling -> NR tab 2 -> Upscale / hires sampling -> NR tab 1 -> NR tab 3 -> Face restoration / ADetailer
+```
+
+**Copy previous tab parameters** copies parameters and insertion point, not the tab's enable switch.
+Each **Output blend** mixes NR with that pass's input, then sends the mixed result to the next pass; `0` still runs the model.
+Passes use the same runtime and GPU. Intermediate images within one stage stay in float32; stage file boundaries remain 8-bit sRGB PNG.
+
+More passes cost additional processing and can amplify changes to lighting, structure or identity. Three passes are not a guaranteed quality improvement
+or equivalent to tripling intensity. Start with one pass and compare. After updating an installed extension, wait for active jobs to finish and restart Forge;
+a browser refresh alone does not reload the Python implementation.
+
 ## Language, Presets And X/Y/Z
 
 The panel reads Forge's `localization` setting when Forge builds its UI. Change the language in Forge's settings
 and reload its UI to apply it everywhere. `zh_CN` and `zh-Hans` use Simplified Chinese; English and unrecognized
 locales use English. The plugin has no independent language setting. Model parameters and presets are unchanged.
-Save presets in the panel. For a 2x2 comparison, choose `Enabled` (`Off, On`) on X and two named `Preset` values on Y.
-With only a preset axis, enable NR in the main panel first. Hires-off normalizes a saved after-hires preset to before-hires.
+Save presets in the panel. New presets contain all three tabs' parameters, switches and insertion points, but not the master switch or environment.
+Loading an old single-pass preset restores it to the first tab and resets the other two tabs to disabled defaults.
+For a 2x2 comparison, choose `Enabled` (`Off, On`) on X and two named `Preset` values on Y.
+With only a preset axis, enable NR in the main panel first. Hires-off normalizes every tab to before-hires.
 
 The model's numeric style/internal-preset controls are experimental indices, not calibrated quality levels.
 The optical-flow flag is retained for parameter compatibility but is not used by still-image processing.
@@ -100,10 +124,16 @@ NR can change material, lighting and identity details: inspect results; it is no
 
 ## API And Compatibility
 
-The always-on script name is `DLSS5 NR`. Its 12 arguments are:
+The always-on script name is `DLSS5 NR`. The UI submits 35 arguments, with the original 12-field prefix:
 `enabled, stage, style, preset, intensity, tone, structure, skin, auto_mask, mix, flow, runtime`.
-`stage` is `before_hr` or `after_hr`; `runtime` is a complete explicit snapshot, not a preset name.
+The suffix is `pass_1_enabled`, followed by the second and third tabs' `enabled, stage` and nine parameter fields,
+prefixed with `pass_2_` and `pass_3_`. `stage` is `before_hr` or `after_hr`; `runtime` is a shared complete snapshot, not a preset name.
+The exact order and validation helpers are in [nr_shared/contract.py](nr_shared/contract.py).
+Legacy 12-field parsing remains supported. API clients should use `script_args(spec, expanded=True)` to explicitly submit every tab switch,
+instead of relying on Forge's saved UI defaults. `make_pass_spec` constructs a validated multi-tab snapshot.
 `GET /forge-nr/capabilities` reports protocol and hook readiness without loading a model.
+Receipts keep `count` as the image count and include `pass_count` plus each executed tab's index, stage and image count.
+A mixed-stage chain reports `stage: mixed`; missing or incomplete pass evidence is rejected.
 
 Tested Forge-neo 2.24 commit `231c0a11038c400a315f1532fb80dd09d67e10f6`: Anima/Qwen VAE, no-hires,
 pixel-hires before/after, same-model latent-hires, batching and ADetailer. Cross-checkpoint/VAE/refiner
@@ -117,6 +147,8 @@ Do not reuse it while the provider may still be writing. A failed or missing NR 
 `python -m unittest discover -s tests` runs CPU checks. Optional native Forge CPU checks:
 set `FORGE_ROOT` and run `python tests/test_plugin.py --native-torch --native-gradio` using Forge's Python.
 Tests do not make a claim that every GPU/driver or runtime combination has been validated.
+The three-tab implementation has CPU execution/receipt coverage and isolated English/Chinese browser coverage,
+including runtime preparation and repair. This public-port validation did not run a GPU model.
 
 Native bridge rebuild: `cmake -S native -B build -A x64`, then `cmake --build build --config Release`.
 The source is pinned to the MIT-licensed [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR)

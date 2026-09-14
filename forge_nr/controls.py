@@ -6,7 +6,17 @@ from pathlib import Path
 import tempfile
 import threading
 
-from nr_shared.contract import STAGES, validate_params
+from nr_shared.contract import STAGES, default_passes, validate_params, validate_passes
+
+
+def preset_passes(record):
+    passes = default_passes()
+    if "passes" in record:
+        selected = validate_passes(record["passes"])
+        passes[:len(selected)] = selected
+    else:
+        passes[0].update(stage=record["stage"], params=validate_params(record["params"]))
+    return passes
 
 
 class Presets:
@@ -32,9 +42,12 @@ class Presets:
             raise ValueError("预设文件格式错误或条数超过256")
         for name, record in data.items():
             self._name(name)
-            if not isinstance(record, dict) or set(record) != {"stage", "params"} or record["stage"] not in STAGES:
-                raise ValueError("预设仅可存插入时机与NR参数")
-            record["params"] = validate_params(record["params"])
+            if isinstance(record, dict) and set(record) == {"passes"}:
+                record["passes"] = validate_passes(record["passes"])
+            elif isinstance(record, dict) and set(record) == {"stage", "params"} and record["stage"] in STAGES:
+                record["params"] = validate_params(record["params"])
+            else:
+                raise ValueError("预设仅可存NR页开关、插入时机与参数")
         return data
 
     def _write(self, records):
@@ -87,4 +100,11 @@ class Presets:
             if name not in data:
                 raise ValueError("没有该预设")
             del data[name]
+            self._write(data)
+
+    def save_passes(self, name, passes):
+        record = dict(passes=validate_passes(passes))
+        with self.lock:
+            data = self._read()
+            data[self._name(name)] = record
             self._write(data)

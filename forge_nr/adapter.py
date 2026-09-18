@@ -76,11 +76,14 @@ class ForgeAdapter:
         return Cancellation(self.shared.state)
 
     def prepare(self, p, spec):
-        if p.enable_hr and active_passes(spec, "before_hr") and p.latent_scale_mode is not None:
+        if getattr(p, "enable_hr", False) and active_passes(spec, "before_hr") and p.latent_scale_mode is not None:
             if (getattr(p, "hr_checkpoint_name", None) not in (None, "", "Use same checkpoint")
                     or getattr(p, "hr_additional_modules", None) not in (None, ["Use same choices"])
                     or getattr(p, "refiner_checkpoint", None) not in (None, "", "None", "none")):
                 raise ValueError("NR高清前 latent 放大不支持跨 checkpoint/VAE/refiner；请选择像素放大或高清后")
+        self.prepare_runtime(spec)
+
+    def prepare_runtime(self, spec):
         status = self.client.runtime(device=spec["runtime"]["device"])
         if not status.get("ready"):
             raise RuntimeError("NR环境不可用：" + "; ".join(map(str, status.get("missing", []))))
@@ -112,6 +115,14 @@ class ForgeAdapter:
         return result.to(device=samples.device, dtype=samples.dtype)
 
     def enhance(self, pixels, spec, cancel, *, stage=None):
+        def progress(event):
+            self.shared.state.textinfo = "NR：" + str(event.get("message", "处理中"))
+
+        enhanced, identities = self.enhance_array(pixels.detach().float().cpu().numpy(), spec, cancel,
+                                                  stage=stage, progress_callback=progress)
+        return self.torch.from_numpy(enhanced), identities
+
+    def enhance_array(self, array, spec, cancel, *, stage=None, progress_callback=None):
         passes = active_passes(spec, stage)
         if not passes or len({record["stage"] for record in passes}) != 1:
             raise ValueError("NR每次处理必须对应一个非空插入阶段")
@@ -123,7 +134,7 @@ class ForgeAdapter:
                     and " ".join(str(native.get("gpu_name", "")).split()).casefold()
                     == " ".join(spec["runtime"]["gpu_name"].split()).casefold())
 
-        array = pixels.detach().float().cpu().numpy()
+        array = np.asarray(array, dtype=np.float32)
         # Anima's Qwen image VAE decodes N,T,C,H,W, even for a still (T=1).
         # Latents use N,C,T,H,W instead: never squeeze that axis or flatten a video.
         if array.ndim == 5 and array.shape[1:3] == (1, 3):
@@ -157,7 +168,8 @@ class ForgeAdapter:
 
                 def progress(event):
                     cancel.check()
-                    self.shared.state.textinfo = "NR：" + str(event.get("message", "处理中"))
+                    if progress_callback is not None:
+                        progress_callback(event)
 
                 result = self.client.run(command, progress=progress, cancel_event=cancel.event)
                 cancel.check()
@@ -192,6 +204,6 @@ class ForgeAdapter:
                 worker_pid = result.get("worker_pid")
                 if not isinstance(instance, str) or not instance or type(worker_pid) is not int or worker_pid <= 0:
                     raise RuntimeError("NR后台没有返回执行实例/worker PID")
-                identities.append(dict(instance=instance, worker_pid=worker_pid,
+                identities.append(dict(instance=instance, worker_pid=worker_pid, request_id=request_id,
                                        pass_indices=[record["index"] for record in passes]))
-        return self.torch.from_numpy(np.stack(enhanced)), identities
+        return np.stack(enhanced), identities

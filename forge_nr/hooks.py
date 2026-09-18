@@ -1,6 +1,7 @@
 """Exception-transparent sampling hooks; never use Forge's swallowing script hooks."""
 from functools import wraps
 from copy import deepcopy
+from contextvars import ContextVar
 import json
 
 from nr_shared.contract import PROTOCOL, SCRIPT_TITLE, active_passes, execution_summary, from_script_args, signature
@@ -9,7 +10,7 @@ _CALL = "_forge_nr_call"
 _REQUEST = "_forge_nr_request"
 
 
-def read_spec(p):
+def read_spec(p, *, img2img=False):
     runner = getattr(p, "scripts", None)
     scripts = getattr(runner, "alwayson_scripts", ())
     found = [s for s in scripts if s.title() == SCRIPT_TITLE]
@@ -18,30 +19,43 @@ def read_spec(p):
     if len(found) != 1:
         raise ValueError("Duplicate NR alwayson scripts")
     script = found[0]
-    return from_script_args(p.script_args[script.args_from:script.args_to], hires=bool(p.enable_hr))
+    if img2img and not getattr(script, "is_img2img", False):
+        return None
+    return from_script_args(p.script_args[script.args_from:script.args_to],
+                            hires=False if img2img else bool(p.enable_hr))
+
+
+def _targets(processing):
+    cls = processing.StableDiffusionProcessingTxt2Img
+    targets = {name: (cls, name) for name in ("sample", "sample_hr_pass")}
+    if hasattr(processing, "StableDiffusionProcessingImg2Img"):
+        targets["process_images_inner"] = (processing, "process_images_inner")
+        targets["post_sample"] = (processing.scripts.ScriptRunner, "post_sample")
+    return targets
 
 
 def install(processing, adapter):
     """Idempotent even after importlib reload; keep later plugins' outer wrappers."""
     cls = processing.StableDiffusionProcessingTxt2Img
-    owners = [_owner(getattr(cls, name), name) for name in ("sample", "sample_hr_pass")]
+    targets = _targets(processing)
+    owners = [_owner(getattr(target, attribute), name) for name, (target, attribute) in targets.items()]
     found = [owner for owner in owners if owner is not None]
     tracked = cls.__dict__.get("_forge_nr_installation")
     if not found and tracked is not None:
         found = [tracked]
     if found:
         owner = found[0]
-        if any(other is not owner for other in found):
+        if any(other is not owner for other in found) or owner.targets != targets:
             raise RuntimeError("Conflicting NR wrapper chains")
-        for name in ("sample", "sample_hr_pass"):
-            current = getattr(cls, name)
+        for name, (target, attribute) in targets.items():
+            current = getattr(target, attribute)
             if _owner(current, name) is owner:
                 continue
             if current is not owner.originals[name]:
                 raise RuntimeError("NR hook was replaced by an opaque plugin; reload Forge before enabling NR")
-        for name in ("sample", "sample_hr_pass"):
-            if getattr(cls, name) is owner.originals[name]:
-                setattr(cls, name, owner.wrappers[name])
+        for name, (target, attribute) in targets.items():
+            if getattr(target, attribute) is owner.originals[name]:
+                setattr(target, attribute, owner.wrappers[name])
         owner.adapter = adapter
         return owner
     return Installation(processing, adapter)
@@ -70,37 +84,104 @@ def _clear(p):
 class Installation:
     def ready(self):
         return self.adapter is not None and all(
-            _owner(getattr(self.cls, name), name) is self for name in self.wrappers)
+            _owner(getattr(target, attribute), name) is self
+            for name, (target, attribute) in self.targets.items())
 
     def __init__(self, processing, adapter):
         self.cls = processing.StableDiffusionProcessingTxt2Img
         self.img_cls = getattr(processing, "StableDiffusionProcessingImg2Img", ())
         self.adapter = adapter
-        self.originals = {name: getattr(self.cls, name) for name in ("sample", "sample_hr_pass")}
+        self.targets = _targets(processing)
+        self.originals = {name: getattr(target, attribute) for name, (target, attribute) in self.targets.items()}
         self.wrappers = {}
+        self.requests = ContextVar("forge_nr_requests", default=())
         self.cls._forge_nr_installation = self
-        for name, invoke in (("sample", self.sample), ("sample_hr_pass", self.sample_hr_pass)):
-            self._wrap(name, invoke)
+        for name in self.targets:
+            self._wrap(name, getattr(self, name))
 
     def _wrap(self, name, invoke):
         original = self.originals[name]
 
         @wraps(original)
         def wrapper(p, *args, **kwargs):
-            if self.adapter is None or not isinstance(p, self.cls) or isinstance(p, self.img_cls):
+            if self.adapter is None or (name in ("sample", "sample_hr_pass")
+                    and (not isinstance(p, self.cls) or isinstance(p, self.img_cls))):
                 return original(p, *args, **kwargs)
             return invoke(p, *args, **kwargs)
 
         wrapper._forge_nr_owner = self
         wrapper._forge_nr_original = original
         self.wrappers[name] = wrapper
-        setattr(self.cls, name, wrapper)
+        target, attribute = self.targets[name]
+        setattr(target, attribute, wrapper)
 
     def close(self):
         self.adapter = None
         for name, wrapper in self.wrappers.items():
-            if getattr(self.cls, name) is wrapper:
-                setattr(self.cls, name, self.originals[name])
+            target, attribute = self.targets[name]
+            if getattr(target, attribute) is wrapper:
+                setattr(target, attribute, self.originals[name])
+
+    def process_images_inner(self, request, *args, **kwargs):
+        parents = self.requests.get()
+        token = self.requests.set((*parents, request))
+        active = False
+        try:
+            if parents or not isinstance(request, self.img_cls):
+                return self.originals["process_images_inner"](request, *args, **kwargs)
+            _clear(request)
+            spec = read_spec(request, img2img=True)
+            if spec is None:
+                return self.originals["process_images_inner"](request, *args, **kwargs)
+            active = True
+            context = dict(spec=deepcopy(spec), identities=[], count=0, pass_counts={}, iteration=-1)
+            setattr(request, _CALL, context)
+            self.adapter.prepare(request, spec)
+            with self.adapter.cancellation() as cancel:
+                context["cancel"] = cancel
+                result = self.originals["process_images_inner"](request, *args, **kwargs)
+                cancel.check()
+                if not context["count"]:
+                    raise RuntimeError("NR img2img did not reach post_sample; no enhancement receipt")
+                return result
+        except BaseException:
+            if active:
+                _clear(request)
+            raise
+        finally:
+            if active and hasattr(request, _CALL):
+                delattr(request, _CALL)
+            self.requests.reset(token)
+
+    def post_sample(self, runner, request, result, *args, **kwargs):
+        native_result = self.originals["post_sample"](runner, request, result, *args, **kwargs)
+        parents = self.requests.get()
+        if len(parents) != 1 or parents[0] is not request or not isinstance(request, self.img_cls):
+            return native_result
+        context = getattr(request, _CALL, None)
+        if context is None:
+            return native_result
+        iteration = getattr(request, "iteration", 0)
+        if iteration != context["iteration"] + 1:
+            raise RuntimeError("NR img2img post_sample iteration was repeated or skipped")
+        context.update(iteration=iteration, iteration_count=None)
+        context["cancel"].check()
+        pixels = self._enhance(self.adapter.decode(request, result.samples), context, "before_hr")
+        result.samples = self.adapter.decoded_result(pixels)
+        self._receipt(request, context)
+        return native_result
+
+    def _receipt(self, request, context):
+        spec = context["spec"]
+        context["count"] += context["iteration_count"] or 0
+        expected = {record["index"]: context["count"] for record in active_passes(spec)}
+        if not context["count"] or context["pass_counts"] != expected:
+            raise RuntimeError("NR没有完成全部启用页，拒绝签发成功收据")
+        identities = context["identities"]
+        receipt = dict(protocol=PROTOCOL, status="done", signature=signature(spec), count=context["count"],
+                       **execution_summary(spec, context["count"]),
+                       **{key: identities[-1][key] for key in ("instance", "worker_pid")})
+        request.extra_generation_params[SCRIPT_TITLE] = json.dumps(receipt, ensure_ascii=False)
 
     def _enhance(self, pixels, context, stage):
         enhanced, identities = self.adapter.enhance(pixels, context["spec"], context["cancel"], stage=stage)
@@ -148,15 +229,7 @@ class Installation:
                 if active_passes(spec, stage):
                     pixels = self._enhance(adapter.decode(p, result), context, stage)
                     result = adapter.decoded_result(pixels)
-                context["count"] += context["iteration_count"] or 0
-                expected = {record["index"]: context["count"] for record in active_passes(spec)}
-                if not context["count"] or context["pass_counts"] != expected:
-                    raise RuntimeError("NR没有完成全部启用页，拒绝签发成功收据")
-                identities = context["identities"]
-                receipt = dict(protocol=PROTOCOL, status="done", signature=signature(spec), count=context["count"],
-                               **execution_summary(spec, context["count"]),
-                               **{key: identities[-1][key] for key in ("instance", "worker_pid")})
-                p.extra_generation_params[SCRIPT_TITLE] = json.dumps(receipt, ensure_ascii=False)
+                self._receipt(p, context)
                 setattr(p, _REQUEST, {key: context[key] for key in
                                      ("spec", "identities", "hires", "iteration", "count", "pass_counts")})
                 return result

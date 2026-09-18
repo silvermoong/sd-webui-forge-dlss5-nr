@@ -73,7 +73,7 @@ class PresetAxis:
             raise ValueError("NR preset was not included in the grid snapshot")
         record = deepcopy(snapshot[name.strip()])
         passes = preset_passes(record)
-        if not processing.enable_hr:
+        if not getattr(processing, "enable_hr", False):
             for selected in passes:
                 selected["stage"] = "before_hr"
         values = {"stage": passes[0]["stage"], **{key: passes[0]["params"][key] for key in PARAM_KEYS}}
@@ -116,8 +116,10 @@ def register(script_data, presets):
             axis = existing[0]
             axis.apply, axis.confirm, axis.choices = apply, confirm, choices
         else:
-            axis = module.AxisOptionTxt2Img(label, str, apply, confirm=confirm, choices=choices)
+            axis = module.AxisOption(label, str, apply, confirm=confirm, choices=choices)
             axis._forge_nr_xyz = label
             module.axis_options.append(axis)
+        axis.is_img2img = False
+        axis.is_txt2img = False
         axes.append(axis)
     return Registration(module, axes)

@@ -3,9 +3,10 @@
 [简体中文](README.zh-CN.md) | [Runtime / model setup](MODEL_SETUP.md)
 
 An **experimental, unofficial** NVIDIA Neural Rendering extension for **Forge-neo on Windows**.
-Enhance generated still images with up to three separately configured NR passes before or after Hires. fix,
+Enhance generated still images with up to three separately configured NR passes before or after Hires. fix, or after img2img sampling,
 with an always-visible header switch, named presets and X/Y/Z comparisons. The panel follows Forge's interface language automatically;
 English and Simplified Chinese are supported, with no separate language selector.
+The separate top-level **DLSS5 NR** tab also enhances uploaded images directly, without diffusion sampling or a VAE round trip.
 
 ![English interface in a CPU-only UI fixture](docs/ui-en.png)
 
@@ -18,10 +19,14 @@ This is not NVIDIA Super Resolution, Ray Reconstruction or a general DLSS SDK in
 
 ## Features
 
+- A top-level **DLSS5 NR** tab beside txt2img/img2img: upload a still image, enhance it directly, compare the result and download a PNG.
+  It has its own cancel button and parameters; it does not use Forge's global interrupt or load a diffusion checkpoint.
 - Header checkbox: enable/disable NR while the panel is collapsed. Off leaves native generation untouched.
 - **1st / 2nd / 3rd tabs**, each with its own enable switch, insertion point and parameters. Only the first tab starts enabled.
-- Enabled before-hires tabs run in tab order, followed by upscaling/hires sampling, then enabled after-hires tabs in tab order.
+- In txt2img, enabled before-hires tabs run in tab order, followed by upscaling/hires sampling, then enabled after-hires tabs in tab order.
   Without Hires. fix, only before-hires is available. All NR passes finish before ADetailer.
+- An independent **img2img** panel runs enabled tabs in order after sampling and latent callbacks, before face restoration and mask compositing.
+  Nested ADetailer redraws do not repeat NR. Uploaded inputs and denoising strength are not changed by NR.
 - Per-tab style/preset indices, intensity, tone, structure, skin, automatic mask and output blend.
   Copy the previous tab's parameters without changing this tab's enable switch.
 - Named parameter presets; `[DLSS5 NR] Enabled` and `[DLSS5 NR] Preset` axes in **X/Y/Z plot**.
@@ -53,7 +58,8 @@ https://github.com/silvermoong/sd-webui-forge-dlss5-nr.git
 2. Open **Extensions -> Install from URL**, paste the repository URL above, leave other fields at their defaults,
   and click **Install**. Dependency preparation starts at this point.
 3. Open **Installed -> Apply and restart UI** after active jobs finish. A browser refresh is not this operation.
-4. Return to **txt2img** and expand **DLSS5 NR**. **Automatic original** prepares a missing runtime and shows download progress.
+4. Return to **txt2img** or **img2img** and expand **DLSS5 NR**. **First-time setup** is below the three parameter tabs.
+  **Automatic original** prepares a missing runtime and shows download progress.
   For an interrupted download, use **Retry runtime and detect GPUs**. Missing dependencies require
   **Advanced: diagnostics and repair -> Repair dependencies and continue**; ordinary retries do not install Python packages.
 5. Click **List GPUs** and select your NVIDIA adapter by model name. The runtime retry button already lists devices.
@@ -85,7 +91,7 @@ follow the recovery action shown in the preparation message instead of deleting 
 An unavailable release download is a publisher/source problem, not a reason to reinstall Forge.
 
 Dependency repair closes only this extension's confirmed-idle controller before reinstalling its dependencies.
-It refuses to run during an NR request or while the controller's state is unknown. Short messages stay at the top;
+It refuses to run during an NR request or while the controller's state is unknown. Short messages appear in **First-time setup**;
 original errors are available under **Diagnostic details** in the Advanced section and clear after a successful preparation.
 
 ## Three-Pass Setup
@@ -94,7 +100,7 @@ After a successful single-pass test, open **2nd** or **3rd**, enable that tab an
 Each pass can use the same values or different ones. Switching tabs only changes the editor view; it does not run NR or select which pass executes.
 Disabled tabs keep their values but do not run. Disabling all tabs leaves native generation untouched, even with the master switch on.
 
-The stages determine execution order. For example, with tab 2 before hires and tabs 1 and 3 after hires:
+In txt2img, the stages determine execution order. For example, with tab 2 before hires and tabs 1 and 3 after hires:
 
 ```text
 First sampling -> NR tab 2 -> Upscale / hires sampling -> NR tab 1 -> NR tab 3 -> Face restoration / ADetailer
@@ -108,15 +114,64 @@ More passes cost additional processing and can amplify changes to lighting, stru
 or equivalent to tripling intensity. Start with one pass and compare. After updating an installed extension, wait for active jobs to finish and restart Forge;
 a browser refresh alone does not reload the Python implementation.
 
+## Direct Image Enhancement
+
+1. Open the top-level **DLSS5 NR** tab, next to txt2img and img2img.
+2. Upload one still image. Prepare the runtime and select the NR GPU in this tab; the runtime files and private worker are shared with the other panels.
+3. Keep **1st** enabled, or configure additional tabs, then click **Enhance image**. There is no master switch or generation prompt on this page.
+4. Compare **Source image** and **NR result**, then use the result's download button to save its PNG.
+
+The source area combines upload and preview: after uploading, it shows the original image with a compact file bar.
+Clear the file to return to the upload area; the old preview, result and receipt are cleared together.
+
+This path is `uploaded pixels -> enabled NR tabs in order -> PNG`. It does not run img2img, sample a diffusion model, encode/decode through a VAE,
+resize the image or invoke face restoration/ADetailer. Image orientation is normalized, embedded color profiles are converted to sRGB,
+and alpha is preserved. The original uploaded file is not changed. Ordinary 8-bit still images are supported, up to an 8192-pixel edge and 32 Mi pixels;
+animated images, video, HDR and batch uploads are not supported by this page.
+
+Named presets remain shared. Their hires insertion points map to direct processing in the current controls without rewriting the preset.
+Every request freezes its pixels, parameters and runtime selection. **Cancel** affects only the current browser session's direct NR job, not Forge generation
+or another session. It waits for confirmed termination; an unknown execution state retains the request files and is not reported as success.
+Starting another job or encountering an error clears the old result and receipt. All tabs disabled is an error, not a successful enhancement.
+
+The download is a PNG containing `DLSS5 NR` and `NR Parameters` metadata. The receipt includes the actual request ID, runtime identity,
+dimensions, pass count and normalized input-pixel digest; it does not copy unrelated source metadata. Outputs use Gradio's temporary cache,
+not Forge's generation-output directory. On 2026-09-17, isolated RTX 5060 Ti tests also passed for 512x512 single/three-pass processing,
+zero-blend RGBA preservation and real Forge upload/download receipts. These are functional checks, not an image-quality benchmark.
+
+## Img2img And Inpainting
+
+Open **img2img** and use its own **DLSS5 NR** header switch. Its three tabs always run **after img2img**, in tab order:
+
+```text
+Native input preparation -> Img2img sampling -> Latent callbacks -> Enabled NR tabs 1, 2, 3 -> Native face restoration / ADetailer and mask compositing
+```
+
+NR does not preprocess the uploaded input or change denoising strength. Setting denoising strength to zero does not disable NR;
+Forge's normal image/VAE path still applies. Inpainting keeps Forge's crop, mask and overlay behavior; NR processes the sampled image or crop
+before the native compositor restores unmasked content when overlay is enabled. Nested redraws inside a generation do not run NR again.
+
+The two panels keep separate switches, parameters and runtime snapshots, while sharing runtime files, the private worker and named presets.
+Loading a hires preset in img2img maps all tabs to after-img2img without rewriting the saved preset. Both XYZ axes are available in img2img.
+After changing the shared runtime source, refresh the UI before using the other panel; stale execution snapshots are rejected.
+Tiled-upscale scripts and extensions that create separate top-level jobs have not been validated. Isolated RTX 5060 Ti img2img tests passed
+with Anima 2.9B/Qwen VAE at 512x512, including NR on/off and hard-mask inpainting with unchanged unmasked pixels; this is not an image-quality claim.
+
 ## Language, Presets And X/Y/Z
 
 The panel reads Forge's `localization` setting when Forge builds its UI. Change the language in Forge's settings
 and reload its UI to apply it everywhere. `zh_CN` and `zh-Hans` use Simplified Chinese; English and unrecognized
 locales use English. The plugin has no independent language setting. Model parameters and presets are unchanged.
-Save presets in the panel. New presets contain all three tabs' parameters, switches and insertion points, but not the master switch or environment.
+The preset toolbar stays above the settings in all three entry points. Its editable dropdown is followed by four square icons:
+**Load**, **Save / replace**, **Delete** and **Refresh list**. Hover for each button's name. Select a saved name and click Load;
+to create a preset, type a new name and click Save. Saving an existing name replaces it. Delete leaves current parameters intact;
+Refresh list picks up presets saved from another panel without loading them. Feedback appears only after an operation or an error.
+
+Presets contain all three tabs' parameters, switches and insertion points, but not the master switch or environment.
 Loading an old single-pass preset restores it to the first tab and resets the other two tabs to disabled defaults.
 For a 2x2 comparison, choose `Enabled` (`Off, On`) on X and two named `Preset` values on Y.
 With only a preset axis, enable NR in the main panel first. Hires-off normalizes every tab to before-hires.
+In img2img, preset tabs are normalized to its single post-sampling insertion point.
 
 The model's numeric style/internal-preset controls are experimental indices, not calibrated quality levels.
 The optical-flow flag is retained for parameter compatibility but is not used by still-image processing.
@@ -128,6 +183,8 @@ The always-on script name is `DLSS5 NR`. The UI submits 35 arguments, with the o
 `enabled, stage, style, preset, intensity, tone, structure, skin, auto_mask, mix, flow, runtime`.
 The suffix is `pass_1_enabled`, followed by the second and third tabs' `enabled, stage` and nine parameter fields,
 prefixed with `pass_2_` and `pass_3_`. `stage` is `before_hr` or `after_hr`; `runtime` is a shared complete snapshot, not a preset name.
+For `/sdapi/v1/img2img`, use `before_hr` for every tab: the existing wire value denotes the sole post-sampling stage on this page.
+An enabled `after_hr` tab is rejected because img2img has no hires pass. There is no additional argument or protocol version.
 The exact order and validation helpers are in [nr_shared/contract.py](nr_shared/contract.py).
 Legacy 12-field parsing remains supported. API clients should use `script_args(spec, expanded=True)` to explicitly submit every tab switch,
 instead of relying on Forge's saved UI defaults. `make_pass_spec` constructs a validated multi-tab snapshot.
@@ -137,7 +194,10 @@ A mixed-stage chain reports `stage: mixed`; missing or incomplete pass evidence 
 
 Tested Forge-neo 2.24 commit `231c0a11038c400a315f1532fb80dd09d67e10f6`: Anima/Qwen VAE, no-hires,
 pixel-hires before/after, same-model latent-hires, batching and ADetailer. Cross-checkpoint/VAE/refiner
-latent-before-hires is rejected. Video and img2img entry points are not exposed by this extension.
+latent-before-hires is rejected. Video remains unsupported. The img2img entry has isolated CPU coverage for latent callbacks, batching,
+nested processing, cancellation, receipts and Forge's ordinary/precise inpaint overlay functions. Additional GPU functional tests used
+Forge commit `c95af9b9f3b8cbd15a1f30b204157658ab734594`, RTX 5060 Ti, driver 610.62 and NVIDIA NR 310.8.0.0;
+they covered the direct-image tab and small Anima 2.9B img2img/inpainting requests, not every extension combination.
 
 On an uncertain submission/termination, the extension preserves that request's temporary directory and reports it.
 Do not reuse it while the provider may still be writing. A failed or missing NR receipt is not treated as success.
@@ -148,7 +208,7 @@ Do not reuse it while the provider may still be writing. A failed or missing NR 
 set `FORGE_ROOT` and run `python tests/test_plugin.py --native-torch --native-gradio` using Forge's Python.
 Tests do not make a claim that every GPU/driver or runtime combination has been validated.
 The three-tab implementation has CPU execution/receipt coverage and isolated English/Chinese browser coverage,
-including runtime preparation and repair. This public-port validation did not run a GPU model.
+including runtime preparation and repair. The initial public-port validation was CPU-only; the 2026-09-17 checks above added a limited real-GPU acceptance run.
 
 Native bridge rebuild: `cmake -S native -B build -A x64`, then `cmake --build build --config Release`.
 The source is pinned to the MIT-licensed [ComfyUI-DLSS5-NR](https://github.com/lisitskyaa/ComfyUI-DLSS5-NR)

@@ -20,9 +20,10 @@ from modules.ui_components import InputAccordion
 from nr_shared.contract import SCRIPT_TITLE
 from forge_nr.adapter import ForgeAdapter
 from forge_nr.controls import Presets
+from forge_nr.direct import DirectProcessor
 from forge_nr.hooks import install
 from forge_nr.lifecycle import Service, app_started
-from forge_nr.ui import build_ui
+from forge_nr.ui import build_direct_tab, build_ui
 from forge_nr.xyz import register as register_xyz
 
 from nr_runtime.setup import RuntimeSetup
@@ -30,6 +31,7 @@ from nr_runtime.setup import RuntimeSetup
 setup = RuntimeSetup(ROOT, models_dir=models_path)
 service = Service(ROOT)
 installation = install(processing, ForgeAdapter(processing, shared, devices, torch, service, ROOT / "tmp"))
+direct = DirectProcessor(ForgeAdapter(None, None, None, None, service, ROOT / "tmp"))
 presets = Presets(EXTENSION / "data")
 xyz_registration = None
 
@@ -48,13 +50,17 @@ class Script(scripts.Script):
         return SCRIPT_TITLE
 
     def show(self, is_img2img):
-        return False if is_img2img else scripts.AlwaysVisible
+        return scripts.AlwaysVisible
 
     def ui(self, is_img2img):
-        if is_img2img:
-            return []
-        return build_ui(gr, service, presets, input_accordion=InputAccordion, hr=self.hr,
+        return build_ui(gr, service, presets, input_accordion=InputAccordion,
+            hr=None if is_img2img else self.hr, is_img2img=is_img2img,
             block=gr.context.Context.root_block, localization=shared.opts.localization, setup=setup)
+
+
+def standalone_tabs():
+    block = build_direct_tab(gr, service, presets, direct, localization=shared.opts.localization, setup=setup)
+    return [(block, SCRIPT_TITLE, "forge_nr_direct")]
 
 
 def started(demo, app):
@@ -74,11 +80,13 @@ def before_ui():
 def cleanup():
     if xyz_registration is not None:
         xyz_registration.close()
+    direct.close()
     installation.close()
     service.close()
 
 
 script_callbacks.on_before_ui(before_ui)
+script_callbacks.on_ui_tabs(standalone_tabs)
 script_callbacks.on_app_started(started)
 script_callbacks.on_before_reload(cleanup)
 script_callbacks.on_script_unloaded(cleanup)

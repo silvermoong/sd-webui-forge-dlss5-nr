@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {mkdir, writeFile} from 'node:fs/promises';
+import {mkdir, readFile, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -8,7 +8,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const origin = 'http://127.0.0.1:7875';
 const folder = path.join(root, 'work', `ui-browser-${Date.now()}`);
 await mkdir(folder, {recursive: true});
-const report = {folder, errors: [], viewports: [], languages: [], multipass: [], passViewports: []};
+const report = {folder, errors: [], viewports: [], languages: [], multipass: [], passViewports: [], img2img: [], img2imgViewports: [], direct: [], directViewports: []};
 const browser = await chromium.launch({channel: 'msedge', headless: true,
   args: ['--disable-gpu', '--disable-background-networking', '--disable-component-update', '--disable-sync']});
 const context = await browser.newContext({viewport: {width: 1440, height: 1000}, serviceWorkers: 'block'});
@@ -16,17 +16,93 @@ await context.route('**/*', route => new URL(route.request().url()).origin === o
 const page = await context.newPage();
 page.on('pageerror', error => report.errors.push(String(error)));
 
-async function capture(enabled) {
-  const previous = await page.locator('#fixture_request textarea').inputValue();
+async function presetToolbar(prefix, locale) {
+  await page.waitForFunction(id => document.querySelectorAll(`#${id} svg[data-forge-nr-preset-icon]`).length === 4,
+    `${prefix}_preset_toolbar`);
+  const geometry = await page.locator(`#${prefix}_preset_toolbar`).evaluate(element => ({
+    top: element.getBoundingClientRect().top,
+    feedbackClipped: (() => {
+      const container = document.getElementById(element.id.replace('_preset_toolbar', '_preset_message'));
+      if (!container?.getClientRects().length) return false;
+      const content = container.querySelector('textarea') || container;
+      return content.scrollHeight > content.clientHeight + 1;
+    })(),
+    textRight: (() => {
+      const input = element.querySelector('input[role="listbox"]');
+      return input.getBoundingClientRect().right - parseFloat(getComputedStyle(input).paddingRight);
+    })(),
+    arrowLeft: element.querySelector('svg.dropdown-arrow').getBoundingClientRect().left,
+    buttons: [...element.querySelectorAll('button.forge-nr-preset-button')].map(button => ({
+      title: button.title, label: button.getAttribute('aria-label'),
+      width: button.getBoundingClientRect().width, height: button.getBoundingClientRect().height,
+      left: button.getBoundingClientRect().left, right: button.getBoundingClientRect().right,
+      top: button.getBoundingClientRect().top
+    }))
+  }));
+  const labels = locale === 'zh' ? ['载入参数', '保存/覆盖当前参数', '删除选中预设', '刷新预设列表'] :
+    ['Load parameters', 'Save / replace preset', 'Delete selected preset', 'Refresh preset list'];
+  assert.deepEqual(geometry.buttons.map(button => button.title), labels);
+  assert.deepEqual(geometry.buttons.map(button => button.label), labels);
+  assert.equal(geometry.feedbackClipped, false, 'Preset feedback must remain fully visible');
+  assert.equal(await page.locator(`#${prefix}_preset_list input`).getAttribute('placeholder'), locale === 'zh' ? '预设' : 'Preset');
+  assert.ok(geometry.textRight <= geometry.arrowLeft + 1, 'Preset name must not overlap the dropdown arrow');
+  assert.ok(geometry.top < (await page.locator(`#${prefix}_passes`).boundingBox()).y);
+  assert.equal(await page.locator(`#${prefix}_preset_name`).count(), 0);
+  for (const button of geometry.buttons) {
+    assert.ok(Math.abs(button.width - 32) <= 1 && Math.abs(button.height - 32) <= 1, 'Preset actions must remain square');
+    assert.ok(Math.abs(button.top - geometry.buttons[0].top) <= 1, 'Preset actions must stay on one row');
+    assert.ok(button.left >= -1 && button.right <= page.viewportSize().width + 1);
+  }
+}
+
+async function presetCrud(locale) {
+  const prefix = 'forge_nr_direct';
+  const field = page.locator(`#${prefix}_preset_list input`);
+  const name = `toolbar-copy-${locale}`;
+  const message = async pattern => page.waitForFunction(expected =>
+    new RegExp(expected).test(document.querySelector('#forge_nr_direct_preset_message')?.textContent || ''), pattern);
+  await field.fill(name);
+  await page.locator(`#${prefix}_save_preset`).click();
+  await message('预设已保存|Preset saved');
+  assert.equal(await field.inputValue(), name);
+  await page.locator(`#${prefix}_load_preset`).click();
+  await message('预设已载入|Preset loaded');
+  await page.locator('#forge_nr_direct').getByRole('tab', {name: '1st', exact: true}).click();
+  const mix = page.locator(`#${prefix}_mix input[type="number"]`);
+  await mix.fill('.27');
+  await mix.press('Tab');
+  await page.locator(`#${prefix}_save_preset`).click();
+  await message('预设已保存|Preset saved');
+  await mix.fill('.91');
+  await mix.press('Tab');
+  await page.locator(`#${prefix}_load_preset`).click();
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .27);
+  await page.locator(`#${prefix}_delete_preset`).click();
+  await message('预设已删除|Preset deleted');
+  assert.equal(await field.inputValue(), '');
+  assert.equal(Number(await mix.inputValue()), .27);
+  await page.locator(`#${prefix}_refresh_presets`).click();
+  await message('预设列表已刷新|Preset list refreshed');
+  await field.click();
+  assert.equal(await page.getByRole('option', {name, exact: true}).count(), 0);
+  await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
+  await page.locator(`#${prefix}_load_preset`).click();
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .31);
+}
+
+async function capture(enabled, img2img = false) {
+  const suffix = img2img ? '_img2img' : '';
+  const selector = `#fixture_request${suffix} textarea`;
+  const previous = await page.locator(selector).inputValue();
   const sequence = previous ? JSON.parse(previous).sequence : 0;
-  await page.locator('#fixture_capture').click();
+  await page.locator(`#fixture_capture${suffix}`).click();
   await page.waitForFunction(expected => {
     try {
-      const value = JSON.parse(document.querySelector('#fixture_request textarea').value);
+      const value = JSON.parse(document.querySelector(expected.selector).value);
       return value.sequence > expected.sequence && value.args[0] === expected.enabled;
     } catch { return false; }
-  }, {sequence, enabled});
-  const result = JSON.parse(await page.locator('#fixture_request textarea').inputValue());
+  }, {sequence, enabled, selector});
+  const result = JSON.parse(await page.locator(selector).inputValue());
   assert.equal(result.synthetic, true);
   assert.equal(result.args.length, 35);
   return result.args;
@@ -40,6 +116,7 @@ async function multipass(locale) {
   await page.waitForFunction(() => document.querySelector('#forge_nr_runtime textarea')?.value.includes('runtime_id'));
   await page.locator('#forge_nr > .label-wrap').click();
   await master.uncheck();
+  await presetToolbar('forge_nr', locale);
   const tab = index => page.getByRole('tab', {name: ['1st', '2nd', '3rd'][index - 1], exact: true}).click();
   const enabled = index => page.locator(`#forge_nr_pass_${index}_enabled input[type="checkbox"]`);
   const key = (index, name) => `forge_nr_${index === 1 ? '' : `pass_${index}_`}${name}`;
@@ -105,11 +182,11 @@ async function multipass(locale) {
   assert.equal(record.spec.passes[1].params.style, 2);
   await enabled(2).check();
   const saved = await snapshot();
-  await page.getByText(locale === 'zh' ? '本地命名参数预设' : 'Named parameter presets', {exact: true}).click();
-  await page.locator('#forge_nr_preset_name').getByRole('textbox').fill(`three-pages-${locale}`);
+  await page.locator('#forge_nr_preset_list input').fill(`three-pages-${locale}`);
+  await page.locator('#forge_nr_preset_list input').press('Enter');
   await page.locator('#forge_nr_save_preset').click();
-  await page.waitForFunction(() => /已保存整组三页|All three tabs saved/.test(
-    document.querySelector('#forge_nr_preset_message textarea')?.value || ''));
+  await page.waitForFunction(() => /预设已保存|Preset saved/.test(
+    document.querySelector('#forge_nr_preset_message')?.textContent || ''));
   await tab(3);
   await number(3, 'mix', .1);
   await enabled(3).uncheck();
@@ -136,6 +213,7 @@ async function multipass(locale) {
     await page.setViewportSize({width, height});
     for (const index of [1, 2, 3]) {
       await tab(index);
+      await presetToolbar('forge_nr', locale);
       const panel = page.locator('#forge_nr_passes');
       await panel.screenshot({path: path.join(folder, `passes-${locale}-${width}x${height}-${index}.png`), animations: 'disabled'});
       const geometry = await page.evaluate(() => {
@@ -173,7 +251,325 @@ async function multipass(locale) {
     stageOrder: [2, 1, 3], copyKeepsDisabled: true, presets: true, legacyMigration: true});
 }
 
+async function img2img(locale) {
+  await page.setViewportSize({width: 1440, height: 1000});
+  await page.goto(`${origin}/i2i-${locale}/`, {waitUntil: 'load'});
+  await page.waitForFunction(() => ['forge_nr', 'forge_nr_img2img'].every(prefix =>
+    document.querySelector(`#${prefix}_runtime textarea`)?.value.includes('runtime_id')));
+  const duplicates = await page.evaluate(() => {
+    const ids = [...document.querySelectorAll('[id^="forge_nr"]')].map(element => element.id);
+    return ids.filter((id, index) => ids.indexOf(id) !== index);
+  });
+  assert.deepEqual(duplicates, []);
+  await page.locator('#forge_nr > .label-wrap').click();
+  await page.locator('#forge_nr-visible-checkbox').uncheck();
+  await page.locator('#forge_nr_mix input[type="number"]').fill('.19');
+  await page.locator('#forge_nr_mix input[type="number"]').press('Tab');
+  await page.locator('#fixture_hr input').check();
+  const txtArgs = await capture(false);
+  const initial = JSON.parse(await page.locator('#fixture_request textarea').inputValue());
+  await page.getByRole('tab', {name: 'img2img', exact: true}).click();
+  const master = page.locator('#forge_nr_img2img-visible-checkbox');
+  assert.equal(await master.isChecked(), false);
+  await page.locator('#forge_nr_img2img > .label-wrap').click();
+  await master.uncheck();
+  await presetToolbar('forge_nr_img2img', locale);
+  const imgArgs = await capture(false, true);
+  assert.equal(imgArgs[9], 1);
+  assert.equal(txtArgs[9], .19);
+  const panel = page.locator('#forge_nr_img2img');
+  const tab = index => panel.getByRole('tab', {name: ['1st', '2nd', '3rd'][index - 1], exact: true}).click();
+  const enabled = index => page.locator(`#forge_nr_img2img_pass_${index}_enabled input[type="checkbox"]`);
+  const snapshot = async (on = true) => {
+    await capture(on, true);
+    return JSON.parse(await page.locator('#fixture_request_img2img textarea').inputValue());
+  };
+  await page.locator('#forge_nr_img2img_preset_list input').click();
+  await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
+  await page.locator('#forge_nr_img2img_load_preset').click();
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_img2img_pass_3_mix input[type="number"]')?.value) === .73);
+  assert.equal(await master.isChecked(), false);
+  assert.match(await page.locator('#forge_nr_img2img_preset_message').innerText(), /图生图后|after img2img/);
+  await master.check();
+  let record = await snapshot();
+  assert.deepEqual(record.spec.passes.map(pass => pass.params.mix), [.31, .52, .73]);
+  assert.deepEqual(record.spec.passes.map(pass => pass.stage), ['before_hr', 'before_hr', 'before_hr']);
+  assert.deepEqual(record.execution_order.map(pass => pass.index), [1, 2, 3]);
+  assert.deepEqual(record.saved_presets, initial.saved_presets);
+  assert.equal(record.args[11], imgArgs[11]);
+  for (const index of [1, 2, 3]) {
+    await tab(index);
+    const prefix = index === 1 ? '' : `pass_${index}_`;
+    const stage = page.locator(`#forge_nr_img2img_${prefix}stage`);
+    assert.equal(await stage.locator('input[type="radio"]').count(), 1);
+    assert.equal(await stage.locator('input[type="radio"]').evaluate(element => element.disabled), true);
+    assert.match(await stage.innerText(), /图生图后|After img2img/);
+    assert.doesNotMatch(await stage.innerText(), /高清|Hires/);
+  }
+  await tab(2);
+  await enabled(2).uncheck();
+  assert.deepEqual((await snapshot()).execution_order.map(pass => pass.index), [1, 3]);
+  await page.locator('#forge_nr_img2img_copy_pass_2').click();
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_img2img_pass_2_mix input[type="number"]')?.value) === .31);
+  assert.equal(await enabled(2).isChecked(), false);
+  for (const index of [1, 3]) {
+    await tab(index);
+    await enabled(index).uncheck();
+  }
+  assert.equal((await snapshot()).spec, null);
+  await page.locator('#forge_nr_img2img_load_preset').click();
+  await page.waitForFunction(() => [1, 2, 3].every(index =>
+    document.querySelector(`#forge_nr_img2img_pass_${index}_enabled input`)?.checked));
+  record = await snapshot();
+  assert.deepEqual(record.saved_presets, initial.saved_presets);
+  for (const [width, height] of [[1440,1000], [1040,900], [768,900], [390,844], [320,720], [1440,540]]) {
+    await page.setViewportSize({width, height});
+    for (const index of [1, 2, 3]) {
+      await tab(index);
+      await presetToolbar('forge_nr_img2img', locale);
+      await page.locator('#forge_nr_img2img_passes').screenshot({
+        path: path.join(folder, `img2img-${locale}-${width}x${height}-${index}.png`), animations: 'disabled'});
+      const geometry = await page.evaluate(() => {
+        const fields = [...document.querySelectorAll('#forge_nr_img2img_passes input, #forge_nr_img2img_passes button')]
+          .filter(element => element.getClientRects().length && element.getBoundingClientRect().width > 0);
+        return {width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth,
+          overflow: fields.filter(element => element.getBoundingClientRect().left < -1 || element.getBoundingClientRect().right > innerWidth + 1)
+            .map(element => element.closest('[id]')?.id),
+          clippedButtons: fields.filter(element => element.tagName === 'BUTTON' && element.scrollWidth > element.clientWidth + 1)
+            .map(element => element.textContent)};
+      });
+      assert.ok(geometry.documentWidth <= geometry.width + 1);
+      assert.deepEqual(geometry.overflow, []);
+      assert.deepEqual(geometry.clippedButtons, []);
+      report.img2imgViewports.push({locale, tab: index, ...geometry});
+    }
+  }
+  await page.setViewportSize({width: 1440, height: 1000});
+  await page.getByRole('tab', {name: 'txt2img', exact: true}).click();
+  assert.deepEqual(await capture(false), txtArgs);
+  await page.locator('#fixture_hr input').uncheck();
+  await page.getByRole('tab', {name: 'img2img', exact: true}).click();
+  assert.deepEqual((await snapshot()).spec, record.spec);
+  report.img2img.push({locale, independentArguments: true, fixedStage: true, presetFileUnchanged: true,
+    stageOrder: [1, 2, 3], disabledSkip: true, allDisabled: true, copyKeepsDisabled: true});
+}
+
+function pngReceipt(bytes) {
+  assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+  let offset = 8;
+  const text = {};
+  while (offset < bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    assert.ok(offset + length + 12 <= bytes.length);
+    if (bytes.toString('ascii', offset + 4, offset + 8) === 'tEXt') {
+      const data = bytes.subarray(offset + 8, offset + 8 + length);
+      const delimiter = data.indexOf(0);
+      assert.ok(delimiter > 0);
+      text[data.toString('latin1', 0, delimiter)] = data.toString('latin1', delimiter + 1);
+    }
+    offset += length + 12;
+  }
+  return JSON.parse(text['DLSS5 NR']);
+}
+
+async function direct(locale) {
+  await page.setViewportSize({width: 1440, height: 1000});
+  await page.goto(`${origin}/direct-${locale}/`, {waitUntil: 'load'});
+  await page.waitForFunction(() => ['forge_nr', 'forge_nr_img2img', 'forge_nr_direct'].every(prefix =>
+    document.querySelector(`#${prefix}_runtime textarea`)?.value.includes('runtime_id')));
+  const txtArgs = await capture(false);
+  await page.getByRole('tab', {name: 'img2img', exact: true}).click();
+  const imgArgs = await capture(false, true);
+  await page.getByRole('tab', {name: 'DLSS5 NR', exact: true}).click();
+  const settings = page.locator('#forge_nr_direct');
+  await presetToolbar('forge_nr_direct', locale);
+  assert.equal(await page.locator('#forge_nr_direct_preset_message').isVisible(), false);
+  const run = page.locator('#forge_nr_direct_enhance');
+  const cancel = page.locator('#forge_nr_direct_cancel');
+  const status = page.locator('#forge_nr_direct_status textarea');
+  const sourceArea = page.locator('#forge_nr_direct_source');
+  assert.equal(await page.locator('#forge_nr_direct_original').isVisible(), false);
+  const emptySource = await sourceArea.boundingBox();
+  assert.equal(Math.round(emptySource.height), 360);
+  await page.locator('#fixture_direct_tab').screenshot({path: path.join(folder, `direct-${locale}-empty.png`), animations: 'disabled'});
+  assert.equal(await page.locator('#forge_nr_direct-checkbox').count(), 0);
+  assert.equal(await cancel.isDisabled(), true);
+  await run.click();
+  await page.waitForFunction(() => /先上传|Upload a still image/.test(document.querySelector('#forge_nr_direct_status textarea')?.value || ''));
+  const sourceBytes = Buffer.from(await page.evaluate(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 160;
+    canvas.height = 96;
+    const drawing = canvas.getContext('2d');
+    const pixels = drawing.createImageData(canvas.width, canvas.height);
+    for (let row = 0; row < canvas.height; row++) {
+      for (let column = 0; column < canvas.width; column++) {
+        const offset = (row * canvas.width + column) * 4;
+        pixels.data.set([30 + column % 180, 60 + row * 2, 210 - column, column > 110 ? 128 : 255], offset);
+      }
+    }
+    drawing.putImageData(pixels, 0, 0);
+    return canvas.toDataURL('image/png').split(',')[1];
+  }), 'base64');
+  await page.locator('#forge_nr_direct_input input[type="file"]').setInputFiles({name: 'direct-fixture.png', mimeType: 'image/png', buffer: sourceBytes});
+  await page.waitForFunction(() => document.querySelector('#forge_nr_direct_original img')?.naturalWidth === 160);
+  assert.equal(await sourceArea.locator('img').count(), 1);
+  const loadedSource = await sourceArea.boundingBox();
+  assert.ok(Math.abs(loadedSource.height - emptySource.height) <= 1, 'Uploading must not resize the original-image area');
+  assert.ok(Math.abs((await page.locator('#forge_nr_direct_input').boundingBox()).height - 64) <= 1);
+  const sourceUrl = await page.locator('#forge_nr_direct_original img').getAttribute('src');
+  const succeed = async () => {
+    const existing = page.locator('#forge_nr_direct_output img');
+    const previous = await existing.count() ? await existing.getAttribute('src') : null;
+    await run.click();
+    await page.waitForFunction(old => {
+      const image = document.querySelector('#forge_nr_direct_output img');
+      return image?.naturalWidth === 160 && image.getAttribute('src') !== old &&
+        /已完成|Completed/.test(document.querySelector('#forge_nr_direct_status textarea')?.value || '');
+    }, previous);
+    assert.equal(await run.isDisabled(), false);
+    assert.equal(await cancel.isDisabled(), true);
+    const url = await page.locator('#forge_nr_direct_output img').getAttribute('src');
+    assert.equal(new URL(url, origin).origin, origin);
+    const response = await context.request.get(new URL(url, origin).href);
+    assert.equal(response.ok(), true);
+    const receipt = pngReceipt(await response.body());
+    assert.equal(receipt.mode, 'direct');
+    assert.equal(receipt.status, 'done');
+    assert.equal(receipt.count, 1);
+    assert.deepEqual([receipt.width, receipt.height], [160, 96]);
+    assert.match(receipt.request_id, /^[a-f0-9]{32}$/);
+    return receipt;
+  };
+  const first = await succeed();
+  assert.equal(first.pass_count, 1);
+  const pixels = await page.evaluate(async () => {
+    const read = selector => {
+      const image = document.querySelector(selector);
+      const canvas = document.createElement('canvas');
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const drawing = canvas.getContext('2d');
+      drawing.drawImage(image, 0, 0);
+      return [...drawing.getImageData(0, 0, canvas.width, canvas.height).data];
+    };
+    return {source: read('#forge_nr_direct_original img'), result: read('#forge_nr_direct_output img')};
+  });
+  let changed = 0;
+  for (let index = 0; index < pixels.source.length; index += 4) {
+    assert.equal(pixels.result[index + 3], pixels.source[index + 3]);
+    if (pixels.source[index + 3] === 255) {
+      for (let channel = 0; channel < 3; channel++) {
+        assert.equal(pixels.result[index + channel], pixels.source[index + channel] >= 128 ? 224 : 16);
+        if (pixels.result[index + channel] !== pixels.source[index + channel]) changed++;
+      }
+    }
+  }
+  assert.ok(changed > 1000);
+  const downloadPromise = page.waitForEvent('download');
+  await page.locator('#forge_nr_direct_output a[download]').click();
+  const download = await downloadPromise;
+  const saved = path.join(folder, `direct-${locale}-download.png`);
+  await download.saveAs(saved);
+  assert.deepEqual(pngReceipt(await readFile(saved)), first);
+  const repeated = await succeed();
+  assert.notEqual(repeated.request_id, first.request_id);
+  assert.equal(repeated.input_sha256, first.input_sha256);
+  await page.locator('#forge_nr_direct_preset_list input').click();
+  await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
+  await page.locator('#forge_nr_direct_load_preset').click();
+  await page.waitForFunction(() => document.querySelector('#forge_nr_direct_pass_3_enabled input')?.checked === true);
+  assert.match(await page.locator('#forge_nr_direct_preset_message').innerText(), /上传图片|uploaded image/);
+  const multiple = await succeed();
+  assert.deepEqual(multiple.passes.map(pass => pass.index), [1, 2, 3]);
+  assert.equal(multiple.pass_count, 3);
+  await presetCrud(locale);
+  const tab = index => settings.getByRole('tab', {name: ['1st', '2nd', '3rd'][index - 1], exact: true}).click();
+  for (const [width, height] of [[1440,1000], [1040,900], [768,900], [390,844], [320,720], [1440,540]]) {
+    await page.setViewportSize({width, height});
+    for (const index of [1, 2, 3]) {
+      await tab(index);
+      await presetToolbar('forge_nr_direct', locale);
+      await page.locator('#fixture_direct_tab').screenshot({path: path.join(folder, `direct-${locale}-${width}x${height}-${index}.png`), animations: 'disabled'});
+      const geometry = await page.evaluate(() => {
+        const fields = [...document.querySelectorAll('#fixture_direct_tab input, #fixture_direct_tab button, #fixture_direct_tab textarea')]
+          .filter(element => element.getClientRects().length && element.getBoundingClientRect().width > 0);
+        return {width: innerWidth, height: innerHeight, documentWidth: document.documentElement.scrollWidth,
+          overflow: fields.filter(element => element.getBoundingClientRect().left < -1 || element.getBoundingClientRect().right > innerWidth + 1)
+            .map(element => element.closest('[id]')?.id),
+          clippedButtons: fields.filter(element => {
+            if (element.tagName !== 'BUTTON') return false;
+            const label = element.classList.contains('label-wrap') ? element.firstElementChild : element;
+            const bounds = element.getBoundingClientRect();
+            const textBounds = label.getBoundingClientRect();
+            return label.scrollWidth > label.clientWidth + 1 || textBounds.left < bounds.left - 1 || textBounds.right > bounds.right + 1;
+          })
+            .map(element => element.textContent)};
+      });
+      assert.ok(geometry.documentWidth <= geometry.width + 1, `Direct page overflow ${locale}/${width}`);
+      assert.deepEqual(geometry.overflow, []);
+      assert.deepEqual(geometry.clippedButtons, []);
+      report.directViewports.push({locale, tab: index, ...geometry});
+    }
+  }
+  await page.setViewportSize({width: 1440, height: 1000});
+  for (const index of [1, 2, 3]) {
+    await tab(index);
+    const prefix = index === 1 ? '' : `pass_${index}_`;
+    assert.equal(await page.locator(`#forge_nr_direct_${prefix}stage`).isVisible(), false);
+    await page.locator(`#forge_nr_direct_pass_${index}_enabled input`).uncheck();
+  }
+  await run.click();
+  await page.waitForFunction(() => /至少启用|Enable at least one/.test(document.querySelector('#forge_nr_direct_status textarea')?.value || ''));
+  assert.equal(await page.locator('#forge_nr_direct_output img').count(), 0);
+  await tab(1);
+  await page.locator('#forge_nr_direct_pass_1_enabled input').check();
+  await succeed();
+  await page.getByText('CPU fixture', {exact: true}).click();
+  const mode = async value => {
+    await page.locator('#fixture_direct_mode').getByRole('radio', {name: value, exact: true}).check();
+    await page.waitForFunction(expected => document.querySelector('#fixture_direct_mode_state textarea')?.value === expected, value);
+  };
+  await mode('wait');
+  await run.click();
+  await page.waitForFunction(() => document.querySelector('#forge_nr_direct_cancel')?.disabled === false);
+  assert.equal(await run.isDisabled(), true);
+  assert.equal(await page.locator('#forge_nr_direct_output img').count(), 0);
+  await cancel.click();
+  await page.waitForFunction(() => /已取消|Canceled/.test(document.querySelector('#forge_nr_direct_status textarea')?.value || ''));
+  assert.equal(await run.isDisabled(), false);
+  assert.equal(await cancel.isDisabled(), true);
+  assert.equal(await page.locator('#forge_nr_direct_output img').count(), 0);
+  await mode('normal');
+  await succeed();
+  await mode('failure');
+  await run.click();
+  await page.waitForFunction(() => document.querySelector('#forge_nr_direct_status textarea')?.value.includes('Synthetic NR failure'));
+  assert.equal(await page.locator('#forge_nr_direct_output img').count(), 0);
+  assert.equal(await run.isDisabled(), false);
+  assert.equal(await page.locator('#forge_nr_direct_original img').getAttribute('src'), sourceUrl);
+  await mode('normal');
+  await succeed();
+  await page.locator('#forge_nr_direct_input').getByRole('button', {name: 'Clear', exact: true}).click();
+  await page.waitForFunction(() => {
+    const source = document.querySelector('#forge_nr_direct_input');
+    const preview = document.querySelector('#forge_nr_direct_original');
+    return source?.getBoundingClientRect().height >= 359 && (!preview || !preview.getClientRects().length);
+  });
+  assert.equal(await page.locator('#forge_nr_direct_output img').count(), 0);
+  assert.equal(await status.inputValue(), '');
+  assert.ok(Math.abs((await sourceArea.boundingBox()).height - emptySource.height) <= 1);
+  await page.getByRole('tab', {name: 'txt2img', exact: true}).click();
+  assert.deepEqual(await capture(false), txtArgs);
+  await page.getByRole('tab', {name: 'img2img', exact: true}).click();
+  assert.deepEqual(await capture(false, true), imgArgs);
+  report.direct.push({locale, upload: true, originalUnchanged: true, pngDownloadReceipt: true, rgbaPixels: true,
+    repeatedRequestIdentities: true, threePasses: true, noPassRejected: true, cancel: true, failureClearsOutput: true, independentTabs: true,
+    singleSourceArea: true, stableSourceHeight: true, clearRestoresUpload: true, compactPresetCrud: true});
+}
+
 try {
+  if (!process.argv.includes('--direct-only')) {
   await page.goto(`${origin}/new/`, {waitUntil: 'load'});
   await page.waitForFunction(() => document.querySelector('#forge_nr_setup_message')?.innerText.includes('Runtime download did not finish'));
   await page.locator('#forge_nr > .label-wrap').click();
@@ -331,6 +727,9 @@ try {
   report.manualModeSurvivesRefresh = true;
   report.manualModeSkipsAutomaticPreparation = true;
   for (const locale of ['en', 'zh']) await multipass(locale);
+  for (const locale of ['en', 'zh']) await img2img(locale);
+  }
+  for (const locale of ['en', 'zh']) await direct(locale);
   assert.deepEqual(report.errors, []);
   report.passed = true;
 } catch (error) {

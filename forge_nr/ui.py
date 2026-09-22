@@ -1,5 +1,6 @@
 """Independent txt2img/img2img controls returning exactly contract.ARG_KEYS."""
 import json
+from pathlib import Path
 
 from nr_shared.contract import ARG_KEYS, DEFAULT_PARAMS, MAX_PASSES, PARAM_KEYS, PASS_KEYS, SCRIPT_TITLE, validate_passes, validate_runtime
 from .controls import preset_passes
@@ -40,11 +41,27 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
         return gr.update(label=text("stage", language), choices=stage_choices(hires),
                          value=stage if hires else "before_hr")
 
+    def preset_catalog():
+        return {name: preset_passes(record) for name, record in presets.snapshot().items()}
+
+    def update_presets(**kwargs):
+        records = preset_catalog()
+        return gr.update(choices=sorted(records), **kwargs), json.dumps(records, ensure_ascii=False)
+
+    def confirm_action(key):
+        message = json.dumps(text(key, language, name="{name}"), ensure_ascii=False)
+        return f"""(title, confirmed, ...values) => {{
+            const root = (typeof gradioApp === 'function' && gradioApp()) || document;
+            const records = JSON.parse(root.querySelector('#{elem_prefix}_preset_catalog textarea')?.value || '{{}}');
+            const name = (title || '').trim();
+            return [title, Object.hasOwn(records, name) && window.confirm({message}.replace('{{name}}', name)), ...values];
+        }}"""
+
     container = gr.Column(elem_id=elem_prefix) if direct else input_accordion(False, label=SCRIPT_TITLE, elem_id=elem_prefix)
     with container as enabled:
         controls["enabled"] = gr.State(True) if direct else enabled
         gr.HTML("""<style>
-.forge-nr-preset-toolbar { display: grid !important; grid-template-columns: minmax(0, 1fr) repeat(4, 32px); gap: 4px !important; align-items: center; }
+.forge-nr-preset-toolbar { display: grid !important; grid-template-columns: minmax(0, 1fr) repeat(2, 32px); gap: 4px !important; align-items: center; }
 .forge-nr-preset-toolbar > .form, .forge-nr-preset-toolbar [id$="_preset_list"] { min-width: 0 !important; }
 .forge-nr-preset-toolbar .wrap-inner { padding: 8px 4px !important; }
 .forge-nr-preset-toolbar input { min-width: 0 !important; width: 100%; margin: 0 !important; padding-right: 24px !important; box-sizing: border-box; text-overflow: ellipsis; }
@@ -52,24 +69,35 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
 .forge-nr-preset-toolbar .options { min-width: 160px; }
 .forge-nr-preset-toolbar .options .item { width: auto !important; white-space: normal; overflow-wrap: anywhere; }
 .forge-nr-preset-toolbar button.forge-nr-preset-button { width: 32px !important; min-width: 32px !important; height: 32px; padding: 0; border-radius: 4px; font-size: 0; flex: none; }
-.forge-nr-preset-button svg { width: 18px; height: 18px; flex: none; pointer-events: none; }
+.forge-nr-preset-button img { width: 18px; height: 18px; margin: 0 !important; flex: none; pointer-events: none; }
+.dark .forge-nr-preset-button img { filter: invert(1); }
 .forge-nr-preset-status { padding: 0 !important; border: 0 !important; background: transparent !important; box-shadow: none !important; }
 .forge-nr-preset-status p { font-size: 12px; margin: 0 !important; overflow-wrap: anywhere; }
+.forge-nr-preset-state { font-size: 12px; min-height: 0 !important; }
+.forge-nr-preset-state:has(span:empty) { display: none !important; }
 </style>""", visible=False)
         with gr.Column(elem_id=elem_prefix + "_presets"):
             try:
-                names, preset_error = presets.names(), ""
+                records, preset_error = preset_catalog(), ""
             except Exception as exc:
-                names, preset_error = [], text("read_presets_failed", language, error=exc)
+                records, preset_error = {}, text("read_presets_failed", language, error=exc)
             with gr.Row(elem_id=elem_prefix + "_preset_toolbar", elem_classes=["forge-nr-preset-toolbar"]):
-                saved = component("Dropdown", "preset_list", "preset_picker", choices=names, value=None,
+                saved = component("Dropdown", "preset_list", "preset_picker", choices=sorted(records), value=None,
                                   allow_custom_value=True, show_label=False, container=False, min_width=0)
                 buttons = []
-                for key, translation in (("load_preset", "load"), ("save_preset", "save"),
-                                         ("delete_preset", "delete"), ("refresh_presets", "refresh_presets")):
+                for key, translation in (("save_preset", "save"), ("delete_preset", "delete")):
                     buttons.append(component("Button", key, translation, property="value", size="sm", scale=0, min_width=32,
+                                             icon=str(Path(__file__).resolve().parents[1] / "javascript/icons" / (translation + ".svg")),
                                              elem_classes=["tool", "forge-nr-preset-button", "forge-nr-" + key]))
-                load, save, delete, refresh = buttons
+                save, delete = buttons
+            selected_preset = component("Textbox", "preset_selection", value="", visible=False)
+            catalog = component("Textbox", "preset_catalog", value=json.dumps(records, ensure_ascii=False), visible=False)
+            confirmed = component("Checkbox", "preset_confirmed", value=False, visible=False)
+            component("HTML", "preset_state", value=(
+                f'<span role="status" data-saved="{text("preset_state_saved", language)}" '
+                f'data-modified="{text("preset_state_modified", language)}" '
+                f'data-new="{text("preset_state_new", language)}"></span>'),
+                elem_classes=["forge-nr-preset-status", "forge-nr-preset-state"])
             preset_message = component("Markdown", "preset_message", value=preset_error,
                                        visible=bool(preset_error), elem_classes=["forge-nr-preset-status"])
         with gr.Tabs(elem_id=elem_prefix + "_passes"):
@@ -183,20 +211,24 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
     def preset_feedback(key, **values):
         return gr.update(value=text(key, language, **values), visible=True)
 
-    def save_preset(title, *values):
+    def save_preset(title, confirmation, *values):
         try:
             records = []
             for offset in range(0, len(values), len(PASS_KEYS)):
                 record = dict(zip(PASS_KEYS, values[offset:offset + len(PASS_KEYS)]))
                 records.append(dict(enabled=record["enabled"], stage=record["stage"],
                                     params={key: record[key] for key in PARAM_KEYS}))
-            presets.save_passes(title, validate_passes(records))
-            return gr.update(choices=presets.names(), value=title.strip()), preset_feedback("direct_saved" if direct else "saved_ok")
+            with presets.lock:
+                if (title or "").strip() in presets.names() and not confirmation:
+                    return gr.update(), gr.update(), preset_feedback("presets_unchanged")
+                presets.save_passes(title, validate_passes(records))
+                return *update_presets(value=title.strip()), preset_feedback("direct_saved" if direct else "saved_ok")
         except Exception as exc:
-            return gr.update(), preset_feedback("save_failed", error=exc)
+            return gr.update(), gr.update(), preset_feedback("save_failed", error=exc)
 
-    def load_preset(title, hires=False):
+    def load_preset(selection, hires=False):
         try:
+            title = json.loads(selection)["name"]
             records = preset_passes(presets.load(title))
             message = text("direct_loaded" if direct else "loaded_ok", language)
             if not hires and any(record["stage"] == "after_hr" for record in records):
@@ -205,22 +237,26 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
             for record in records:
                 values.extend([record["enabled"], stage_update(hires, record["stage"]),
                                *(record["params"][key] for key in PARAM_KEYS)])
-            return [*values, gr.update(value=message, visible=True)]
+            return [*update_presets(value=title), *values, gr.update(value=message, visible=True)]
         except Exception as exc:
-            return [*(gr.update() for _ in range(MAX_PASSES * len(PASS_KEYS))), preset_feedback("load_failed", error=exc)]
+            return [*(gr.update() for _ in range(2 + MAX_PASSES * len(PASS_KEYS))), preset_feedback("load_failed", error=exc)]
 
-    def delete_preset(title):
+    def delete_preset(title, confirmation):
+        if not confirmation:
+            return gr.update(), gr.update(), preset_feedback("presets_unchanged")
         try:
             presets.delete(title)
-            return gr.update(choices=presets.names(), value=None), preset_feedback("deleted_ok")
+            return *update_presets(value=None), preset_feedback("deleted_ok")
         except Exception as exc:
-            return gr.update(), preset_feedback("delete_failed", error=exc)
+            return gr.update(), gr.update(), preset_feedback("delete_failed", error=exc)
 
-    def refresh_presets():
+    def refresh_presets(previous):
         try:
-            return gr.update(choices=presets.names()), preset_feedback("presets_refreshed")
+            if json.loads(previous) == preset_catalog():
+                return gr.update(), gr.update()
+            return update_presets()
         except Exception as exc:
-            return gr.update(), preset_feedback("read_presets_failed", error=exc)
+            raise gr.Error(text("read_presets_failed", language, error=exc)) from exc
 
     def select_device(selected):
         _, raw, detail = snapshot(selected)
@@ -304,11 +340,15 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
     status_button.click(lambda: backend("status"), outputs=[backend_status], **event)
     release.click(lambda: backend("release"), outputs=[backend_status], **event)
     page_controls = [control for page in pages for control in page]
-    save.click(save_preset, inputs=[saved, *page_controls], outputs=[saved, preset_message], **event)
-    load.click(load_preset, inputs=[saved, *([hr] if hr is not None else [])],
-               outputs=[*page_controls, preset_message], **event)
-    delete.click(delete_preset, inputs=[saved], outputs=[saved, preset_message], **event)
-    refresh.click(refresh_presets, outputs=[saved, preset_message], **event)
+    save.click(save_preset, inputs=[saved, confirmed, *page_controls], outputs=[saved, catalog, preset_message],
+               js=confirm_action("confirm_overwrite"), **event)
+    selected_preset.input(load_preset, inputs=[selected_preset, *([hr] if hr is not None else [])],
+                          outputs=[saved, catalog, *page_controls, preset_message], trigger_mode="always_last", **event)
+    delete.click(delete_preset, inputs=[saved, confirmed], outputs=[saved, catalog, preset_message],
+                 js=confirm_action("confirm_delete"), **event)
+    saved.focus(refresh_presets, inputs=[catalog], outputs=[saved, catalog], **event)
+    for control in [saved, catalog, *page_controls]:
+        control.change(fn=None, js="() => { window.forgeNRPresets?.refresh(); }", queue=False, **event)
     for index, button in enumerate(copy_buttons, 1):
         button.click(lambda where, *values: [gr.update(value=where), *values],
                      inputs=pages[index - 1][1:], outputs=pages[index][1:], **event)

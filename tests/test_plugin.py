@@ -1409,6 +1409,12 @@ class ControlTests(unittest.TestCase):
             def input(self, fn, inputs=None, outputs=None, **kwargs):
                 self.events["input"] = (fn, inputs or [], outputs or [])
 
+            def select(self, fn, inputs=None, outputs=None, **kwargs):
+                self.events["select"] = (fn, inputs or [], outputs or [])
+
+            def focus(self, fn, inputs=None, outputs=None, **kwargs):
+                self.events["focus"] = (fn, inputs or [], outputs or [])
+
             def load(self, fn, inputs=None, outputs=None, **kwargs):
                 self.events["load"] = (fn, inputs or [], outputs or [])
 
@@ -1470,6 +1476,10 @@ class ControlTests(unittest.TestCase):
             def input_accordion(value, *, label, elem_id):
                 return Component("InputAccordion", value, elem_id=elem_id + "-checkbox")
             controls = build_ui(gr, service, Presets(Path(directory)), input_accordion=input_accordion, hr=hr, block=block)
+            def choose(prefix="forge_nr"):
+                selection = gr.by_id[prefix + "_preset_selection"]
+                selection.value = json.dumps({"name": gr.by_id[prefix + "_preset_list"].value})
+                selection.fire("input")
             self.assertEqual(controls[0].kind, "InputAccordion")
             from forge_nr.i18n import EN
             self.assertEqual([component.value for component in gr.components
@@ -1482,6 +1492,13 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(json.loads(controls[11].value), RUNTIME)
             self.assertEqual(len(controls), 35)
             self.assertTrue(gr.by_id["forge_nr_preset_list"].allow_custom_value)
+            self.assertEqual([component.elem_id for component in gr.components
+                              if component.kind == "Button" and component.elem_id in {
+                                  "forge_nr_load_preset", "forge_nr_save_preset",
+                                  "forge_nr_delete_preset", "forge_nr_refresh_presets"}],
+                             ["forge_nr_save_preset", "forge_nr_delete_preset"])
+            self.assertNotIn("select", gr.by_id["forge_nr_preset_list"].events)
+            self.assertIn("input", gr.by_id["forge_nr_preset_selection"].events)
             self.assertFalse(gr.by_id["forge_nr_preset_message"].visible)
             self.assertNotIn("forge_nr_preset_name", gr.by_id)
             self.assertEqual([gr.by_id[f"forge_nr_pass_{index}_enabled"].value for index in range(1, 4)],
@@ -1513,7 +1530,7 @@ class ControlTests(unittest.TestCase):
             hr.value = False
             hr.fire("change")
             self.assertEqual(controls[1].value, "before_hr")
-            gr.by_id["forge_nr_load_preset"].fire("click")
+            choose()
             self.assertEqual(controls[4].value, DEFAULT_PARAMS["intensity"])
             self.assertEqual(controls[1].value, "before_hr")
             self.assertTrue(controls[0].value)
@@ -1533,7 +1550,7 @@ class ControlTests(unittest.TestCase):
             gr.by_id["forge_nr_save_preset"].fire("click")
             gr.by_id["forge_nr_pass_2_tone"].value = 1.8
             gr.by_id["forge_nr_pass_3_enabled"].value = False
-            gr.by_id["forge_nr_load_preset"].fire("click")
+            choose()
             spec = from_script_args([control.value for control in controls], hires=True)
             self.assertEqual(spec["passes"][1]["params"]["tone"], .7)
             self.assertTrue(spec["passes"][2]["enabled"])
@@ -1555,7 +1572,7 @@ class ControlTests(unittest.TestCase):
             self.assertTrue(set(control.elem_id for control in controls).isdisjoint(
                 control.elem_id for control in img_controls))
             gr.by_id["forge_nr_img2img_preset_list"].value = "three-pages"
-            gr.by_id["forge_nr_img2img_load_preset"].fire("click")
+            choose("forge_nr_img2img")
             self.assertIn("图生图后", gr.by_id["forge_nr_img2img_preset_message"].value)
             self.assertFalse(img_controls[0].value)
             self.assertEqual(json.loads(img_controls[11].value), RUNTIME)
@@ -1578,20 +1595,32 @@ class ControlTests(unittest.TestCase):
             self.assertTrue(gr.by_id["forge_nr_preset_message"].visible)
             self.assertEqual([control.value for control in controls], before_toolbar)
             gr.by_id["forge_nr_mix"].value = .42
+            unchanged = preset_path.read_bytes()
+            gr.by_id["forge_nr_save_preset"].fire("click")
+            self.assertEqual(preset_path.read_bytes(), unchanged)
+            gr.by_id["forge_nr_preset_confirmed"].value = True
             gr.by_id["forge_nr_save_preset"].fire("click")
             self.assertEqual(presets.load("toolbar-copy")["passes"][0]["params"]["mix"], .42)
             before_delete = copy.deepcopy([control.value for control in controls])
+            unchanged = preset_path.read_bytes()
+            gr.by_id["forge_nr_preset_confirmed"].value = False
+            gr.by_id["forge_nr_delete_preset"].fire("click")
+            self.assertEqual(preset_path.read_bytes(), unchanged)
+            gr.by_id["forge_nr_preset_confirmed"].value = True
             gr.by_id["forge_nr_delete_preset"].fire("click")
             self.assertNotIn("toolbar-copy", presets.names())
             self.assertIsNone(gr.by_id["forge_nr_preset_list"].value)
             self.assertEqual([control.value for control in controls], before_delete)
-            gr.by_id["forge_nr_load_preset"].fire("click")
+            choose()
             self.assertIn("Load failed", gr.by_id["forge_nr_preset_message"].value)
             self.assertEqual([control.value for control in controls], before_delete)
             presets.save("shared-new", "before_hr", DEFAULT_PARAMS)
-            gr.by_id["forge_nr_refresh_presets"].fire("click")
+            gr.by_id["forge_nr_preset_list"].fire("focus")
             self.assertIn("shared-new", gr.by_id["forge_nr_preset_list"].choices)
             self.assertEqual([control.value for control in controls], before_delete)
+            choices = gr.by_id["forge_nr_preset_list"].choices
+            gr.by_id["forge_nr_preset_list"].fire("focus")
+            self.assertIs(gr.by_id["forge_nr_preset_list"].choices, choices)
             service.failed = True
             gr.by_id["forge_nr_device"].fire("input")
             self.assertEqual(gr.by_id["forge_nr_device"].value, "cuda:1")
@@ -1756,8 +1785,6 @@ class ControlTests(unittest.TestCase):
             os.environ["GRADIO_TEMP_DIR"] = directory
             os.environ["MPLCONFIGDIR"] = directory
             os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
-            # No event loop is needed to build components. Prevent Windows'
-            # auto-created asyncio loop from opening its socketpair listener.
             import asyncio
             asyncio.set_event_loop(None)
             import gradio as gr
@@ -1831,6 +1858,10 @@ class ControlTests(unittest.TestCase):
                 self.assertLess(ids.index(prefix + "_presets"), ids.index(prefix + "_passes"))
                 self.assertLess(ids.index(prefix + "_passes"), ids.index(prefix + "_setup"))
                 self.assertLess(ids.index(prefix + "_setup"), ids.index(prefix + "_device"))
+                for action in ("save_preset", "delete_preset"):
+                    props = next(item["props"] for item in combined_config["components"]
+                                 if item["props"].get("elem_id") == prefix + "_" + action)
+                    self.assertTrue(props.get("icon"), "Preset icons must render without toolbar JavaScript")
             components = {component.elem_id: component for component in direct_ui.blocks.values() if component.elem_id}
             functions = {getattr(function.fn, "__name__", None): function for function in direct_ui.fns.values()}
             run = functions["run_direct"]
@@ -1972,6 +2003,9 @@ if __name__ == "__main__":
                 raise AssertionError("Forbidden in Forge plugin test: " + fullname)
 
     sys.meta_path.insert(0, ImportGuard())
+    if NATIVE_GRADIO:
+        from fsspec.asyn import get_loop
+        get_loop()
     with ExitStack() as guards:
         for obj, name in [(socket.socket, "connect"), (socket.socket, "connect_ex"), (socket.socket, "bind"),
                           (socket, "create_connection"), (subprocess, "Popen"), (os, "system")]:

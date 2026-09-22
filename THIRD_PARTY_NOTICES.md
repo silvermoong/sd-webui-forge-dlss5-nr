@@ -69,8 +69,9 @@ SOFTWARE.
 
 ## Lucide Toolbar Icons
 
-The preset toolbar includes the `folder-input`, `save`, `trash-2` and `refresh-cw` icon shapes from
-`lucide-static` 0.468.0, embedded locally in [javascript/forge_nr_presets.js](javascript/forge_nr_presets.js).
+The preset toolbar uses the `save` and `trash-2` icon shapes from `lucide-static` 0.468.0,
+stored locally in [javascript/icons/save.svg](javascript/icons/save.svg) and
+[javascript/icons/delete.svg](javascript/icons/delete.svg).
 
 Reference: https://lucide.dev
 Source: https://www.npmjs.com/package/lucide-static/v/0.468.0

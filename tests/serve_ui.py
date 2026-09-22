@@ -44,6 +44,8 @@ def main(check, forge_root=None):
     forge = Path(forge_root or os.environ["FORGE_ROOT"]).resolve()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    from fsspec.asyn import get_loop
+    get_loop()
     sys.addaudithook(guard)
     import gradio as gr
     import uvicorn
@@ -134,7 +136,7 @@ function onUiLoaded(callback) {
   const observer = new MutationObserver(check);
   observer.observe(document.documentElement, {childList: true, subtree: true}); check();
 }
-""" + (forge / "javascript/inputAccordion.js").read_text(encoding="utf-8") + "\n" + (ROOT / "javascript/forge_nr_presets.js").read_text(encoding="utf-8") + "</script>"
+""" + (forge / "javascript/inputAccordion.js").read_text(encoding="utf-8") + "\nif (!new URLSearchParams(location.search).has('without-presets-js')) {\n" + (ROOT / "javascript/forge_nr_presets.js").read_text(encoding="utf-8") + "\n}</script>"
     script_path = ROOT / "scripts/forge_nr_script.py"
     script = next(node for node in ast.parse(script_path.read_text(encoding="utf-8")).body
                   if isinstance(node, ast.ClassDef) and node.name == "Script")

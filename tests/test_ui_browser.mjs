@@ -15,10 +15,29 @@ const context = await browser.newContext({viewport: {width: 1440, height: 1000},
 await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
 const page = await context.newPage();
 page.on('pageerror', error => report.errors.push(String(error)));
+report.presetRequests = [];
+page.on('request', request => {
+  if (request.method() !== 'POST' || !request.url().includes('/queue/join')) return;
+  const data = request.postDataJSON();
+  const selection = data?.data?.[0];
+  if (typeof selection === 'string' && selection.startsWith('{"name":')) {
+    report.presetRequests.push({selection: JSON.parse(selection), fn: data.fn_index});
+  }
+});
+
+async function selectPreset(prefix, name) {
+  await page.locator(`#${prefix}_preset_list input`).click();
+  await page.locator(`#${prefix}_preset_list`).getByRole('option', {name, exact: true}).click();
+}
 
 async function presetToolbar(prefix, locale) {
-  await page.waitForFunction(id => document.querySelectorAll(`#${id} svg[data-forge-nr-preset-icon]`).length === 4,
-    `${prefix}_preset_toolbar`);
+  await page.waitForFunction(id => {
+    const buttons = [...document.querySelectorAll(`#${id} button.forge-nr-preset-button`)];
+    return buttons.length === 2 && buttons.every(button => {
+      const icon = button.querySelector('img');
+      return icon?.complete && icon.naturalWidth > 0;
+    });
+  }, `${prefix}_preset_toolbar`);
   const geometry = await page.locator(`#${prefix}_preset_toolbar`).evaluate(element => ({
     top: element.getBoundingClientRect().top,
     feedbackClipped: (() => {
@@ -36,11 +55,18 @@ async function presetToolbar(prefix, locale) {
       title: button.title, label: button.getAttribute('aria-label'),
       width: button.getBoundingClientRect().width, height: button.getBoundingClientRect().height,
       left: button.getBoundingClientRect().left, right: button.getBoundingClientRect().right,
-      top: button.getBoundingClientRect().top
+      top: button.getBoundingClientRect().top,
+      ink: (() => {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 24;
+        const context = canvas.getContext('2d');
+        context.drawImage(button.querySelector('img'), 0, 0, 24, 24);
+        return context.getImageData(0, 0, 24, 24).data.filter((value, index) => index % 4 === 3 && value > 0).length;
+      })()
     }))
   }));
-  const labels = locale === 'zh' ? ['载入参数', '保存/覆盖当前参数', '删除选中预设', '刷新预设列表'] :
-    ['Load parameters', 'Save / replace preset', 'Delete selected preset', 'Refresh preset list'];
+  const labels = locale === 'zh' ? ['保存/覆盖当前参数', '删除选中预设'] :
+    ['Save / replace preset', 'Delete selected preset'];
   assert.deepEqual(geometry.buttons.map(button => button.title), labels);
   assert.deepEqual(geometry.buttons.map(button => button.label), labels);
   assert.equal(geometry.feedbackClipped, false, 'Preset feedback must remain fully visible');
@@ -49,6 +75,7 @@ async function presetToolbar(prefix, locale) {
   assert.ok(geometry.top < (await page.locator(`#${prefix}_passes`).boundingBox()).y);
   assert.equal(await page.locator(`#${prefix}_preset_name`).count(), 0);
   for (const button of geometry.buttons) {
+    assert.ok(button.ink > 20, 'Preset icon pixels must not be blank');
     assert.ok(Math.abs(button.width - 32) <= 1 && Math.abs(button.height - 32) <= 1, 'Preset actions must remain square');
     assert.ok(Math.abs(button.top - geometry.buttons[0].top) <= 1, 'Preset actions must stay on one row');
     assert.ok(button.left >= -1 && button.right <= page.viewportSize().width + 1);
@@ -58,35 +85,108 @@ async function presetToolbar(prefix, locale) {
 async function presetCrud(locale) {
   const prefix = 'forge_nr_direct';
   const field = page.locator(`#${prefix}_preset_list input`);
-  const name = `toolbar-copy-${locale}`;
+  const name = `toolbar-copy-${locale}-${Date.now()}`;
+  const state = page.locator(`#${prefix}_preset_state span`);
+  const catalog = page.locator(`#${prefix}_preset_catalog textarea`);
+  const selection = page.locator(`#${prefix}_preset_selection textarea`);
   const message = async pattern => page.waitForFunction(expected =>
     new RegExp(expected).test(document.querySelector('#forge_nr_direct_preset_message')?.textContent || ''), pattern);
+  const savedState = locale === 'zh' ? '已保存' : 'Saved';
+  const dirtyState = locale === 'zh' ? '已修改 · 未保存' : 'Modified (not saved)';
+  const waitState = expected => page.waitForFunction(text =>
+    document.querySelector('#forge_nr_direct_preset_state span')?.textContent === text, expected);
+  const confirm = async (action, accept) => {
+    const requested = page.waitForEvent('dialog', {timeout: 5000});
+    const click = page.locator(`#${prefix}_${action}_preset`).click();
+    const dialog = await requested;
+    assert.equal(dialog.type(), 'confirm');
+    assert.ok(dialog.message().includes(name));
+    if (accept) await dialog.accept(); else await dialog.dismiss();
+    await click;
+  };
+  const select = async title => {
+    await field.click();
+    await page.locator(`#${prefix}_preset_list`).getByRole('option', {name: title, exact: true}).click();
+  };
+  await page.locator('#forge_nr_direct').getByRole('tab', {name: '1st', exact: true}).click();
+  const mix = page.locator(`#${prefix}_mix input[type="number"]`);
+  await select('hires-fixture');
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .31);
+  await mix.fill('.91');
+  await mix.press('Tab');
+  await select('hires-fixture');
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .31,
+    null, {timeout: 4000});
+  const priorSelection = await selection.inputValue();
+  await field.fill('legacy-fixture');
+  await field.press('Enter');
+  assert.equal(await selection.inputValue(), priorSelection, 'Typing an existing name must not load it');
+  assert.equal(Number(await mix.inputValue()), .31);
+  await field.click();
+  await field.fill('legacy-fixture');
+  await field.press('ArrowDown');
+  assert.equal(await selection.inputValue(), priorSelection, 'Arrow navigation must not apply parameters');
+  await field.press('Escape');
+  await field.press('Tab');
+  assert.equal(await selection.inputValue(), priorSelection, 'Escape and blur must not apply parameters');
+  await field.click();
+  await field.fill('legacy-fixture');
+  const options = page.locator(`#${prefix}_preset_list [role="option"]`);
+  await options.first().waitFor({state: 'visible'});
+  const optionCount = await options.count();
+  for (let attempt = 0; attempt < optionCount; attempt++) {
+    await field.press('ArrowDown');
+    if (await page.locator(`#${prefix}_preset_list [role="option"].active`).getAttribute('aria-label') === 'legacy-fixture') break;
+  }
+  assert.equal(await page.locator(`#${prefix}_preset_list [role="option"].active`).getAttribute('aria-label'), 'legacy-fixture');
+  await field.press('Enter');
+  await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .25);
   await field.fill(name);
   await page.locator(`#${prefix}_save_preset`).click();
   await message('预设已保存|Preset saved');
+  await waitState(savedState);
   assert.equal(await field.inputValue(), name);
-  await page.locator(`#${prefix}_load_preset`).click();
+  await select(name);
   await message('预设已载入|Preset loaded');
-  await page.locator('#forge_nr_direct').getByRole('tab', {name: '1st', exact: true}).click();
-  const mix = page.locator(`#${prefix}_mix input[type="number"]`);
   await mix.fill('.27');
   await mix.press('Tab');
-  await page.locator(`#${prefix}_save_preset`).click();
+  await waitState(dirtyState);
+  await mix.fill('.25');
+  await mix.press('Tab');
+  await waitState(savedState);
+  await mix.fill('.27');
+  await mix.press('Tab');
+  await waitState(dirtyState);
+  const beforeReplace = await catalog.inputValue();
+  await confirm('save', false);
+  await message('预设未改动|Presets unchanged');
+  assert.equal(await catalog.inputValue(), beforeReplace);
+  assert.equal(Number(await mix.inputValue()), .27);
+  assert.equal(await state.textContent(), dirtyState);
+  await confirm('save', true);
   await message('预设已保存|Preset saved');
+  await waitState(savedState);
+  assert.equal(JSON.parse(await catalog.inputValue())[name][0].params.mix, .27);
   await mix.fill('.91');
   await mix.press('Tab');
-  await page.locator(`#${prefix}_load_preset`).click();
+  await waitState(dirtyState);
+  await select(name);
   await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .27);
-  await page.locator(`#${prefix}_delete_preset`).click();
+  await waitState(savedState);
+  const beforeDelete = await catalog.inputValue();
+  await confirm('delete', false);
+  await message('预设未改动|Presets unchanged');
+  assert.equal(await catalog.inputValue(), beforeDelete);
+  assert.equal(await field.inputValue(), name);
+  assert.equal(Number(await mix.inputValue()), .27);
+  await confirm('delete', true);
   await message('预设已删除|Preset deleted');
+  await waitState('');
   assert.equal(await field.inputValue(), '');
   assert.equal(Number(await mix.inputValue()), .27);
-  await page.locator(`#${prefix}_refresh_presets`).click();
-  await message('预设列表已刷新|Preset list refreshed');
   await field.click();
   assert.equal(await page.getByRole('option', {name, exact: true}).count(), 0);
   await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
-  await page.locator(`#${prefix}_load_preset`).click();
   await page.waitForFunction(() => Number(document.querySelector('#forge_nr_direct_mix input[type="number"]')?.value) === .31);
 }
 
@@ -182,7 +282,8 @@ async function multipass(locale) {
   assert.equal(record.spec.passes[1].params.style, 2);
   await enabled(2).check();
   const saved = await snapshot();
-  await page.locator('#forge_nr_preset_list input').fill(`three-pages-${locale}`);
+  const presetName = `three-pages-${locale}-${Date.now()}`;
+  await page.locator('#forge_nr_preset_list input').fill(presetName);
   await page.locator('#forge_nr_preset_list input').press('Enter');
   await page.locator('#forge_nr_save_preset').click();
   await page.waitForFunction(() => /预设已保存|Preset saved/.test(
@@ -191,7 +292,7 @@ async function multipass(locale) {
   await number(3, 'mix', .1);
   await enabled(3).uncheck();
   await master.uncheck();
-  await page.locator('#forge_nr_load_preset').click();
+  await selectPreset('forge_nr', presetName);
   await page.waitForFunction(() => document.querySelector('#forge_nr_pass_3_enabled input')?.checked === true);
   assert.equal(await master.isChecked(), false);
   await capture(false);
@@ -205,7 +306,7 @@ async function multipass(locale) {
     await enabled(index).uncheck();
   }
   assert.equal((await snapshot()).spec, null);
-  await page.locator('#forge_nr_load_preset').click();
+  await selectPreset('forge_nr', presetName);
   await page.waitForFunction(() => [1, 2, 3].every(index =>
     document.querySelector(`#forge_nr_pass_${index}_enabled input`)?.checked === true));
   assert.deepEqual((await snapshot()).spec, saved.spec);
@@ -240,7 +341,6 @@ async function multipass(locale) {
   assert.deepEqual(record.execution_order.map(pass => pass.index), [1, 2, 3]);
   await page.locator('#forge_nr_preset_list input').click();
   await page.getByRole('option', {name: 'legacy-fixture', exact: true}).click();
-  await page.locator('#forge_nr_load_preset').click();
   await page.waitForFunction(() => document.querySelector('#forge_nr_pass_3_enabled input')?.checked === false);
   record = await snapshot();
   assert.equal(record.spec.params.mix, .25);
@@ -286,7 +386,6 @@ async function img2img(locale) {
   };
   await page.locator('#forge_nr_img2img_preset_list input').click();
   await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
-  await page.locator('#forge_nr_img2img_load_preset').click();
   await page.waitForFunction(() => Number(document.querySelector('#forge_nr_img2img_pass_3_mix input[type="number"]')?.value) === .73);
   assert.equal(await master.isChecked(), false);
   assert.match(await page.locator('#forge_nr_img2img_preset_message').innerText(), /图生图后|after img2img/);
@@ -317,7 +416,7 @@ async function img2img(locale) {
     await enabled(index).uncheck();
   }
   assert.equal((await snapshot()).spec, null);
-  await page.locator('#forge_nr_img2img_load_preset').click();
+  await selectPreset('forge_nr_img2img', 'hires-fixture');
   await page.waitForFunction(() => [1, 2, 3].every(index =>
     document.querySelector(`#forge_nr_img2img_pass_${index}_enabled input`)?.checked));
   record = await snapshot();
@@ -477,7 +576,6 @@ async function direct(locale) {
   assert.equal(repeated.input_sha256, first.input_sha256);
   await page.locator('#forge_nr_direct_preset_list input').click();
   await page.getByRole('option', {name: 'hires-fixture', exact: true}).click();
-  await page.locator('#forge_nr_direct_load_preset').click();
   await page.waitForFunction(() => document.querySelector('#forge_nr_direct_pass_3_enabled input')?.checked === true);
   assert.match(await page.locator('#forge_nr_direct_preset_message').innerText(), /上传图片|uploaded image/);
   const multiple = await succeed();
@@ -569,6 +667,25 @@ async function direct(locale) {
 }
 
 try {
+  if (process.argv.includes('--multipass-only')) {
+    for (const locale of ['en', 'zh']) await multipass(locale);
+  } else if (process.argv.includes('--presets-only')) {
+    for (const locale of ['en', 'zh']) {
+      await page.goto(`${origin}/direct-${locale}/`, {waitUntil: 'load'});
+      await page.waitForFunction(() => document.querySelector('#forge_nr_direct_runtime textarea')?.value.includes('runtime_id'));
+      await page.getByRole('tab', {name: 'DLSS5 NR', exact: true}).click();
+      await presetToolbar('forge_nr_direct', locale);
+      await presetCrud(locale);
+      report.languages.push(locale);
+    }
+    await page.goto(`${origin}/direct-en/?without-presets-js`, {waitUntil: 'load'});
+    await page.getByRole('tab', {name: 'DLSS5 NR', exact: true}).click();
+    await page.waitForFunction(() => [...document.querySelectorAll('#forge_nr_direct_preset_toolbar button img')]
+      .filter(image => image.complete && image.naturalWidth > 0).length === 2);
+    assert.equal(await page.evaluate(() => typeof window.forgeNRPresets), 'undefined');
+    await page.locator('#forge_nr_direct_preset_toolbar').screenshot({path: path.join(folder, 'icons-without-script.png')});
+    report.nativeIconsWithoutScript = true;
+  } else {
   if (!process.argv.includes('--direct-only')) {
   await page.goto(`${origin}/new/`, {waitUntil: 'load'});
   await page.waitForFunction(() => document.querySelector('#forge_nr_setup_message')?.innerText.includes('Runtime download did not finish'));
@@ -730,10 +847,17 @@ try {
   for (const locale of ['en', 'zh']) await img2img(locale);
   }
   for (const locale of ['en', 'zh']) await direct(locale);
+  }
   assert.deepEqual(report.errors, []);
   report.passed = true;
 } catch (error) {
   report.failure = String(error.stack || error);
+  report.presetFailure = await page.evaluate(() => [...document.querySelectorAll('.forge-nr-preset-toolbar')].map(toolbar => {
+    const prefix = toolbar.id.replace(/_preset_toolbar$/, '');
+    return {prefix, name: toolbar.querySelector('input')?.value,
+      selection: document.querySelector(`#${prefix}_preset_selection textarea`)?.value,
+      message: document.querySelector(`#${prefix}_preset_message`)?.textContent};
+  })).catch(() => []);
   await page.screenshot({path: path.join(folder, 'failure.png'), fullPage: true}).catch(() => {});
   process.exitCode = 1;
 } finally {

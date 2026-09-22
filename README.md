@@ -162,10 +162,14 @@ with Anima 2.9B/Qwen VAE at 512x512, including NR on/off and hard-mask inpaintin
 The panel reads Forge's `localization` setting when Forge builds its UI. Change the language in Forge's settings
 and reload its UI to apply it everywhere. `zh_CN` and `zh-Hans` use Simplified Chinese; English and unrecognized
 locales use English. The plugin has no independent language setting. Model parameters and presets are unchanged.
-The preset toolbar stays above the settings in all three entry points. Its editable dropdown is followed by four square icons:
-**Load**, **Save / replace**, **Delete** and **Refresh list**. Hover for each button's name. Select a saved name and click Load;
-to create a preset, type a new name and click Save. Saving an existing name replaces it. Delete leaves current parameters intact;
-Refresh list picks up presets saved from another panel without loading them. Feedback appears only after an operation or an error.
+The preset toolbar stays above the settings in all three entry points, with two square icons: **Save / replace** and **Delete**.
+Hover for each button's name. Click a saved option, or use the arrow keys followed by Enter, to apply it immediately.
+Typing a name only filters or names a preset; arrow-key browsing, Escape and losing focus do not apply parameters.
+To create a preset, type a new name and click Save. Replacing an existing preset and deleting one require confirmation;
+canceling leaves the preset and current parameters unchanged. Delete keeps current parameters.
+The saved/unsaved indicator compares all three tabs with the saved record. Reselecting the same preset restores it;
+editing back to the saved values clears the unsaved state. Focusing the dropdown refreshes the shared list without loading a preset.
+Icons are local resources rendered by Gradio, including when the toolbar script has not initialized.
 
 Presets contain all three tabs' parameters, switches and insertion points, but not the master switch or environment.
 Loading an old single-pass preset restores it to the first tab and resets the other two tabs to disabled defaults.

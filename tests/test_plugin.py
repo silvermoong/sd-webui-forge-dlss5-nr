@@ -1775,6 +1775,7 @@ class ControlTests(unittest.TestCase):
     @unittest.skipUnless(NATIVE_GRADIO, "optional real Forge Gradio CPU validation")
     def test_real_gradio_build_and_numeric_script_arguments(self):
         import ast
+        from base64 import b64decode
         import inspect
         import warnings
         from functools import wraps
@@ -1802,6 +1803,15 @@ class ControlTests(unittest.TestCase):
             namespace["repair"](gr.Checkbox)
             with patch("gradio.component_meta.create_or_modify_pyi", return_value=None):
                 exec(compile(ast.Module(body=definitions, type_ignores=[]), str(source), "exec"), namespace)
+            cache_source = source.with_name("ui_tempdir.py")
+            cache_definitions = [item for item in ast.parse(cache_source.read_text(encoding="utf-8")).body
+                                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                                 and item.name in ("check_tmp_file", "async_move_files_to_cache")]
+            self.assertEqual(len(cache_definitions), 2)
+            cache_namespace = dict(gr=gr, gradio=gr, os=os, shared=SimpleNamespace(demo=None))
+            exec(compile(ast.Module(body=cache_definitions, type_ignores=[]), str(cache_source), "exec"), cache_namespace)
+            self.enterContext(patch.object(gr.processing_utils, "async_move_files_to_cache",
+                                          cache_namespace["async_move_files_to_cache"]))
             setup = SimpleNamespace(mode="auto", runtime_dir=Path(directory) / "runtime")
             with gr.Blocks(analytics_enabled=False) as block:
                 hr = gr.Checkbox(False)
@@ -1862,6 +1872,12 @@ class ControlTests(unittest.TestCase):
                     props = next(item["props"] for item in combined_config["components"]
                                  if item["props"].get("elem_id") == prefix + "_" + action)
                     self.assertTrue(props.get("icon"), "Preset icons must render without toolbar JavaScript")
+                    self.assertTrue(props["icon"].get("url"), "Forge must expose a browser URL, not only a local icon path")
+                    header, encoded = props["icon"]["url"].split(",", 1)
+                    self.assertEqual(header, "data:image/svg+xml;base64")
+                    icon_path = ROOT / "javascript/icons" / (action.split("_")[0] + ".svg")
+                    self.assertEqual(props["icon"]["path"], icon_path.name)
+                    self.assertEqual(b64decode(encoded, validate=True), icon_path.read_bytes())
             components = {component.elem_id: component for component in direct_ui.blocks.values() if component.elem_id}
             functions = {getattr(function.fn, "__name__", None): function for function in direct_ui.fns.values()}
             run = functions["run_direct"]

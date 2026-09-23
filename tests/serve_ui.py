@@ -35,7 +35,7 @@ def guard(event, args):
 
 def definitions(path, names, namespace):
     nodes = [node for node in ast.parse(path.read_text(encoding="utf-8")).body
-             if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+             if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
     assert len(nodes) == len(names)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
 
@@ -63,6 +63,10 @@ def main(check, forge_root=None):
     namespace["repair"](gr.Checkbox)
     with patch("gradio.component_meta.create_or_modify_pyi", return_value=None):
         definitions(forge / "modules/ui_components.py", {"InputAccordionImpl", "InputAccordion"}, namespace)
+    forge_shared = SimpleNamespace(demo=None)
+    cache_namespace = dict(gr=gr, gradio=gr, os=os, shared=forge_shared)
+    definitions(forge / "modules/ui_tempdir.py", {"check_tmp_file", "async_move_files_to_cache"}, cache_namespace)
+    gr.processing_utils.async_move_files_to_cache = cache_namespace["async_move_files_to_cache"]
     runtime = dict(bridge="fixture-bridge", runtime_dir="fixture-runtime", gpu_index=0,
                    device="cuda:1", gpu_name="Synthetic GPU (no NR)", channel_order="RGBA", runtime_id="a" * 64)
 
@@ -146,6 +150,7 @@ function onUiLoaded(callback) {
         app = FastAPI()
 
         def page(locale, scenario="ready", dual=False, direct=False):
+            forge_shared.demo = None
             calls = []
             repairs = 0
             automatic_preparations = 0
@@ -251,6 +256,7 @@ function onUiLoaded(callback) {
                                     mode.change(change_direct_mode, inputs=[mode], outputs=[mode_state], queue=False, api_name=False)
                 else:
                     panel(False)
+            forge_shared.demo = block
             return block
 
         for route, locale, scenario, dual, direct in (("/en", "None", "ready", False, False), ("/zh", "zh_CN", "ready", False, False),
@@ -263,6 +269,9 @@ function onUiLoaded(callback) {
             assert all(len(item["outputs"]) == len(set(item["outputs"])) for item in config["dependencies"])
             element_ids = [item["props"]["elem_id"] for item in config["components"] if item["props"].get("elem_id")]
             assert len(element_ids) == len(set(element_ids))
+            for item in config["components"]:
+                if item["props"].get("elem_id", "").endswith(("_save_preset", "_delete_preset")):
+                    assert item["props"].get("icon", {}).get("url", "").startswith("data:image/svg+xml;base64,")
             app = gr.mount_gradio_app(app, block, path=route)
         if check:
             print("CPU_UI_CONFIG_OK: actual Forge entry; 35 inputs per mode; txt2img/img2img/direct; English/Chinese")

@@ -56,6 +56,7 @@ async function presetToolbar(prefix, locale) {
       width: button.getBoundingClientRect().width, height: button.getBoundingClientRect().height,
       left: button.getBoundingClientRect().left, right: button.getBoundingClientRect().right,
       top: button.getBoundingClientRect().top,
+      embeddedIcon: button.querySelector('img').currentSrc.startsWith('data:image/svg+xml;base64,'),
       ink: (() => {
         const canvas = document.createElement('canvas');
         canvas.width = canvas.height = 24;
@@ -75,6 +76,7 @@ async function presetToolbar(prefix, locale) {
   assert.ok(geometry.top < (await page.locator(`#${prefix}_passes`).boundingBox()).y);
   assert.equal(await page.locator(`#${prefix}_preset_name`).count(), 0);
   for (const button of geometry.buttons) {
+    assert.equal(button.embeddedIcon, true, 'Preset icons must not depend on Forge startup file caching');
     assert.ok(button.ink > 20, 'Preset icon pixels must not be blank');
     assert.ok(Math.abs(button.width - 32) <= 1 && Math.abs(button.height - 32) <= 1, 'Preset actions must remain square');
     assert.ok(Math.abs(button.top - geometry.buttons[0].top) <= 1, 'Preset actions must stay on one row');
@@ -681,7 +683,7 @@ try {
     await page.goto(`${origin}/direct-en/?without-presets-js`, {waitUntil: 'load'});
     await page.getByRole('tab', {name: 'DLSS5 NR', exact: true}).click();
     await page.waitForFunction(() => [...document.querySelectorAll('#forge_nr_direct_preset_toolbar button img')]
-      .filter(image => image.complete && image.naturalWidth > 0).length === 2);
+      .filter(image => image.complete && image.naturalWidth > 0 && image.currentSrc.startsWith('data:image/svg+xml;base64,')).length === 2);
     assert.equal(await page.evaluate(() => typeof window.forgeNRPresets), 'undefined');
     await page.locator('#forge_nr_direct_preset_toolbar').screenshot({path: path.join(folder, 'icons-without-script.png')});
     report.nativeIconsWithoutScript = true;

@@ -1,4 +1,5 @@
 """Independent txt2img/img2img controls returning exactly contract.ARG_KEYS."""
+from base64 import b64encode
 import json
 from pathlib import Path
 
@@ -86,8 +87,11 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
                                   allow_custom_value=True, show_label=False, container=False, min_width=0)
                 buttons = []
                 for key, translation in (("save_preset", "save"), ("delete_preset", "delete")):
+                    icon_path = Path(__file__).resolve().parents[1] / "javascript/icons" / (translation + ".svg")
+                    icon = {"path": icon_path.name,
+                            "url": "data:image/svg+xml;base64," + b64encode(icon_path.read_bytes()).decode("ascii")}
                     buttons.append(component("Button", key, translation, property="value", size="sm", scale=0, min_width=32,
-                                             icon=str(Path(__file__).resolve().parents[1] / "javascript/icons" / (translation + ".svg")),
+                                             icon=icon,
                                              elem_classes=["tool", "forge-nr-preset-button", "forge-nr-" + key]))
                 save, delete = buttons
             selected_preset = component("Textbox", "preset_selection", value="", visible=False)

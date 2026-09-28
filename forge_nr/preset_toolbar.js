@@ -1,4 +1,10 @@
-(() => {
+() => {
+    // Gradio runs this from the page config on load. Forge serves javascript/*.js through Gradio's
+    // /file= route, which answers 403 for a junctioned extension outside Forge's allowed paths.
+    if (window.forgeNRPresets) {
+        window.forgeNRPresets.refresh();
+        return;
+    }
     const watched = new WeakSet();
     let revision = 0;
 
@@ -65,6 +71,4 @@
 
     window.forgeNRPresets = {refresh: install};
     install();
-    if (typeof onUiLoaded === 'function') onUiLoaded(install);
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, {once: true});
-})();
+}

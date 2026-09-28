@@ -38,6 +38,8 @@ async function presetToolbar(prefix, locale) {
       return icon?.complete && icon.naturalWidth > 0;
     });
   }, `${prefix}_preset_toolbar`);
+  await page.waitForFunction(id => document.getElementById(id)?.dataset.forgeNrPresetsReady === 'true', `${prefix}_preset_toolbar`);
+  assert.equal(await page.locator('script[src*="preset"]').count(), 0, 'The toolbar script must arrive in the Gradio config, not as a served file');
   const geometry = await page.locator(`#${prefix}_preset_toolbar`).evaluate(element => ({
     top: element.getBoundingClientRect().top,
     feedbackClipped: (() => {
@@ -684,7 +686,7 @@ try {
     await page.getByRole('tab', {name: 'DLSS5 NR', exact: true}).click();
     await page.waitForFunction(() => [...document.querySelectorAll('#forge_nr_direct_preset_toolbar button img')]
       .filter(image => image.complete && image.naturalWidth > 0 && image.currentSrc.startsWith('data:image/svg+xml;base64,')).length === 2);
-    assert.equal(await page.evaluate(() => typeof window.forgeNRPresets), 'undefined');
+    assert.equal(await page.locator('#forge_nr_direct_preset_toolbar').getAttribute('data-forge-nr-presets-ready'), null);
     await page.locator('#forge_nr_direct_preset_toolbar').screenshot({path: path.join(folder, 'icons-without-script.png')});
     report.nativeIconsWithoutScript = true;
   } else {

@@ -8,6 +8,7 @@ from .controls import preset_passes
 from .i18n import forge_language, preparation_message, text
 
 STAGES = ("before_hr", "after_hr")
+PRESET_TOOLBAR_JS = Path(__file__).with_name("preset_toolbar.js").read_text(encoding="utf-8")
 
 
 def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, localization=None, setup=None,
@@ -368,6 +369,8 @@ def build_ui(gr, service, presets, *, input_accordion, hr=None, block=None, loca
         for page in pages:
             hr.change(stage_update, inputs=[hr, page[1]], outputs=[page[1]], queue=False, **event)
     if block is not None:
+        # The page config carries the toolbar script; see preset_toolbar.js for why Forge's file route cannot.
+        block.load(fn=None, js=PRESET_TOOLBAR_JS, queue=False, **event)
         if setup is None:
             block.load(snapshot, inputs=[device], outputs=[device, runtime, environment], **event)
         else:

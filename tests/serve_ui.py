@@ -140,7 +140,11 @@ function onUiLoaded(callback) {
   const observer = new MutationObserver(check);
   observer.observe(document.documentElement, {childList: true, subtree: true}); check();
 }
-""" + (forge / "javascript/inputAccordion.js").read_text(encoding="utf-8") + "\nif (!new URLSearchParams(location.search).has('without-presets-js')) {\n" + (ROOT / "javascript/forge_nr_presets.js").read_text(encoding="utf-8") + "\n}</script>"
+""" + (forge / "javascript/inputAccordion.js").read_text(encoding="utf-8") + """
+// Like Forge, the fixture never serves the toolbar script: the plugin ships it in the Gradio config.
+// Pre-claiming its global simulates a page where that script never initialized.
+if (new URLSearchParams(location.search).has('without-presets-js')) window.forgeNRPresets = {refresh() {}};
+</script>"""
     script_path = ROOT / "scripts/forge_nr_script.py"
     script = next(node for node in ast.parse(script_path.read_text(encoding="utf-8")).body
                   if isinstance(node, ast.ClassDef) and node.name == "Script")

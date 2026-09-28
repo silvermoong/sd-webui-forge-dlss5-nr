@@ -1393,6 +1393,7 @@ class ControlTests(unittest.TestCase):
                 self.visible = kwargs.get("visible", True)
                 self.allow_custom_value = kwargs.get("allow_custom_value", False)
                 self.events = {}
+                self.scripts = []
 
             def __enter__(self):
                 return self
@@ -1416,7 +1417,10 @@ class ControlTests(unittest.TestCase):
                 self.events["focus"] = (fn, inputs or [], outputs or [])
 
             def load(self, fn, inputs=None, outputs=None, **kwargs):
-                self.events["load"] = (fn, inputs or [], outputs or [])
+                if fn is None:
+                    self.scripts.append(kwargs["js"])
+                else:
+                    self.events["load"] = (fn, inputs or [], outputs or [])
 
             def fire(self, event):
                 events = self.events[event] if isinstance(self.events[event], list) else [self.events[event]]
@@ -1488,6 +1492,8 @@ class ControlTests(unittest.TestCase):
             self.assertFalse(controls[0].value)
             self.assertEqual([x.elem_id for x in controls], ["forge_nr-checkbox", *["forge_nr_" + key for key in ARG_KEYS[1:]]])
             block.fire("load")
+            self.assertEqual(len(block.scripts), 1)
+            self.assertIn("window.forgeNRPresets = {refresh: install}", block.scripts[0])
             self.assertEqual(service.enumerations, 0)
             self.assertEqual(json.loads(controls[11].value), RUNTIME)
             self.assertEqual(len(controls), 35)
@@ -1755,6 +1761,16 @@ class ControlTests(unittest.TestCase):
             (base / "nr_shared/contract.py").write_text("", encoding="utf-8")
             self.assertEqual(discover_root(base), base)
 
+    def test_preset_toolbar_script_ships_in_gradio_config_not_forge_file_route(self):
+        # Forge serves <extension>/javascript/*.js through Gradio's /file= route. Gradio resolves a
+        # junctioned extension to its real path and answers 403 outside Forge's allowed paths.
+        self.assertEqual(sorted(path.name for path in (ROOT / "javascript").glob("*.*js")), [])
+        from forge_nr.ui import PRESET_TOOLBAR_JS
+        source = PRESET_TOOLBAR_JS.strip()
+        self.assertTrue(source.startswith("() => {") and source.endswith("}"), "Gradio evaluates js as (source)(...args)")
+        self.assertIn("window.forgeNRPresets = {refresh: install}", source)
+        self.assertIn("if (window.forgeNRPresets)", source.split("function paint", 1)[0])
+
     def test_entry_registers_a_top_level_direct_tab(self):
         import ast
         from unittest.mock import Mock
@@ -1858,6 +1874,11 @@ class ControlTests(unittest.TestCase):
                     with gr.Tab(SCRIPT_TITLE):
                         direct_ui.render()
             combined_config = combined.get_config_file()
+            toolbar_scripts = [dependency for dependency in combined_config["dependencies"]
+                               if "window.forgeNRPresets = {refresh: install}" in (dependency.get("js") or "")]
+            self.assertEqual(len(toolbar_scripts), 3, "Each entry must ship the preset toolbar script in the page config")
+            self.assertTrue(all(not dependency["backend_fn"] and [target[1] for target in dependency["targets"]] == ["load"]
+                                for dependency in toolbar_scripts))
             ids = [item["props"]["elem_id"] for item in combined_config["components"] if item["props"].get("elem_id")]
             self.assertEqual(len(ids), len(set(ids)))
             from forge_nr.i18n import EN
